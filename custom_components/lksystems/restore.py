@@ -28,8 +28,8 @@ from typing import Any
 
 from homeassistant.util import dt as dt_util
 
-# "Cloud" distinguishes this from lastStatus/"Last Data Sent" (when the
-# *device* last sent LK's cloud data - a value we only relay) and from the
+# "Cloud" distinguishes this from lastStatus/"Last Device Report" (when the
+# *device* last reported to LK's cloud - a value we only relay) and from the
 # coordinator's own last_update_attempt_time (every poll attempt, whether
 # or not it succeeded) - this is specifically when *our own* last
 # successful fetch from LK's cloud API happened.

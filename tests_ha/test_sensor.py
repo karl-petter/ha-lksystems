@@ -64,9 +64,9 @@ def _device_name(hass, identity: str) -> str:
 
 
 async def test_last_status_sensor_name_says_what_it_represents(hass, fake_manager):
-    """lastStatus is the device's last data transmission to LK's cloud
-    (confirmed against the LK app's own "Last data sent" wording), not a
-    generic "status" - the entity name should say so."""
+    """lastStatus is when the device itself last reported to LK's cloud,
+    not a generic "status" and not something the integration sends -
+    the entity name should say so without implying either of those."""
     await setup_entry(hass, fake_manager)
 
     last_status_entity_id = entity_id(
@@ -74,7 +74,7 @@ async def test_last_status_sensor_name_says_what_it_represents(hass, fake_manage
     )
     state = hass.states.get(last_status_entity_id)
 
-    assert state.attributes["friendly_name"] == "Cubic Secure Utility Room Last Data Sent"
+    assert state.attributes["friendly_name"] == "Cubic Secure Utility Room Last Device Report"
 
 
 class TestArcSensorHasEntityName:
@@ -161,8 +161,8 @@ async def test_low_value_sensors_are_disabled_by_default(hass, fake_manager):
 async def test_safety_and_primary_sensors_stay_enabled_by_default(
     hass, fake_manager
 ):
-    """lastStatus ("Last Data Sent") is device-freshness information, not
-    low-value: it's the only signal that the device itself has gone quiet,
+    """lastStatus ("Last Device Report") is device-freshness information,
+    not low-value: it's the only signal that the device itself has gone quiet,
     as distinct from last_successful_cloud_fetch (an attribute on every
     cubic sensor), which only says the integration's own poll of LK's cloud
     API succeeded - LK's cloud can keep serving a stale cached reading
