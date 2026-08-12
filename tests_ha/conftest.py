@@ -22,6 +22,7 @@ from unittest.mock import patch
 import pytest
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import issue_registry as ir
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.lksystems.const import DOMAIN
@@ -383,3 +384,8 @@ def entity_id(hass, platform: str, unique_id: str) -> str:
     found = er.async_get(hass).async_get_entity_id(platform, DOMAIN, unique_id)
     assert found is not None, f"no {platform} entity registered for {unique_id!r}"
     return found
+
+
+def get_issue(hass, issue_id: str):
+    """Look up a repair issue by id via the issue registry."""
+    return ir.async_get(hass).async_get_issue(DOMAIN, issue_id)
