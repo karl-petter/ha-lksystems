@@ -353,7 +353,9 @@ def fake_manager() -> FakeLKSystemsManager:
     return manager
 
 
-async def setup_entry(hass, manager: FakeLKSystemsManager) -> MockConfigEntry:
+async def setup_entry(
+    hass, manager: FakeLKSystemsManager, options: dict | None = None
+) -> MockConfigEntry:
     """Drive a real config-entry setup against a FakeLKSystemsManager.
 
     Runs the coordinator's first refresh and both the sensor.py and
@@ -363,6 +365,7 @@ async def setup_entry(hass, manager: FakeLKSystemsManager) -> MockConfigEntry:
     entry = MockConfigEntry(
         domain=DOMAIN,
         data={CONF_USERNAME: "user@example.com", CONF_PASSWORD: "hunter2"},
+        options=options or {},
     )
     entry.add_to_hass(hass)
     with patch("custom_components.lksystems.LKSystemsManager", return_value=manager):
