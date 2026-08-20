@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from contextlib import contextmanager
 from unittest.mock import patch
 
 import pytest
@@ -430,6 +431,12 @@ def entity_id(hass, platform: str, unique_id: str) -> str:
     return found
 
 
+def patch_coordinator_manager(manager: FakeLKSystemsManager):
+    """Patch the LKSystemsManager the coordinator itself constructs
+    (setup, polling refresh)."""
+    return patch("custom_components.lksystems.LKSystemsManager", return_value=manager)
+
+
 def patch_services_manager(manager: FakeLKSystemsManager):
     """Patch the LKSystemsManager used by services.py's own handlers.
 
@@ -442,6 +449,21 @@ def patch_services_manager(manager: FakeLKSystemsManager):
     return patch(
         "custom_components.lksystems.services.LKSystemsManager", return_value=manager
     )
+
+
+@contextmanager
+def patch_all_managers(manager: FakeLKSystemsManager):
+    """Patch every place LKSystemsManager gets constructed: the coordinator
+    (its polling refresh) and services.py (service handlers).
+
+    patch_services_manager() alone only covers a service call itself;
+    needed on top of that by anything that also triggers a coordinator
+    refresh in the same action (e.g. valve.py's open/close), since that
+    refresh would otherwise fall through to a real, unpatched
+    LKSystemsManager and attempt a genuine network call.
+    """
+    with patch_coordinator_manager(manager), patch_services_manager(manager):
+        yield
 
 
 @pytest.fixture
@@ -473,7 +495,7 @@ async def setup_entry(
         options=options or {},
     )
     entry.add_to_hass(hass)
-    with patch("custom_components.lksystems.LKSystemsManager", return_value=manager):
+    with patch_coordinator_manager(manager):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
     return entry
