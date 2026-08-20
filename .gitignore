@@ -5,5 +5,8 @@ __pycache__
 .pytest_cache/
 TODO.local.md
 .vscode/
-.claude/
+# Local-only Claude Code state (per-machine settings, scheduler lock); skills
+# are shared tooling and stay tracked.
+.claude/*
+!.claude/skills/
 .mcp.json
