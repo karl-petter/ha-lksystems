@@ -38,14 +38,11 @@ class LKCubicSecureValve(CoordinatorEntity[LKSystemCoordinator], ValveEntity):
     picks up a state change from any source - a scheduled poll, or the
     valve being toggled from the vendor app - not just its own actions.
     Open/close delegate to the existing open_valve/close_valve services
-    (rather than duplicating their login/error-handling), followed by a
-    coordinator refresh: valveState is fetched independently of the write
-    itself, so without that refresh the entity would only reflect the
-    change once the next scheduled poll happens to run. A full refresh
-    costs an extra round-trip beyond just the write, but for a water
-    shutoff valve, showing "closed" when the command may have silently
-    failed is worse than that cost - see set_thermostat_temperature()
-    for the same trade-off already made elsewhere in this integration.
+    (rather than duplicating their login/error-handling), followed by
+    force_cubic_secure_configuration_update(): valveState is fetched
+    independently of the write itself and the LK API caches it
+    server-side, so a generic coordinator refresh isn't enough to
+    reliably reflect the change (see that method's own docstring).
     Doesn't report a position: the API only exposes open/closed, not a
     percentage.
     """
@@ -89,4 +86,6 @@ class LKCubicSecureValve(CoordinatorEntity[LKSystemCoordinator], ValveEntity):
     async def _async_call_valve_service(self, service: str) -> None:
         called = await async_call_cubic_secure_service(self.hass, self._device_identity, service)
         if called:
-            await self.coordinator.async_request_refresh()
+            await self.coordinator.force_cubic_secure_configuration_update(
+                self._device_identity
+            )

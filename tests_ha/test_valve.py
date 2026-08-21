@@ -71,8 +71,12 @@ async def test_action_calls_the_client_and_refreshes(
     )
     await setup_entry(hass, fake_manager)
     valve_entity_id = entity_id(hass, "valve", _valve_unique_id(CUBIC_IDENTITY))
-    # The fake client only reflects the new state once refreshed -
-    # confirms the post-action coordinator refresh actually happened.
+    # A fresh cached (force_update=False) response still showing the
+    # pre-action state - proves the entity forces a fresh fetch rather
+    # than relying on a regular refresh, which would keep serving this.
+    fake_manager.cubic_configurations_cached_by_device[CUBIC_IDENTITY] = (
+        build_cubic_configuration(valve_state=starting_state)
+    )
     fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = build_cubic_configuration(
         valve_state=resulting_state
     )

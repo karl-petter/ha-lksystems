@@ -41,6 +41,7 @@ from .conftest import (
     HUB_IDENTITY,
     SENSOR_MAC,
     THERMOSTAT_MAC,
+    build_cubic_configuration,
     get_issue,
 )
 
@@ -441,6 +442,116 @@ class TestForceDeviceUpdate:
 
         with _patch_manager(fake_manager):
             result = await coordinator.force_device_update(THERMOSTAT_MAC)
+
+        assert result is False
+
+
+class TestForceCubicSecureConfigurationUpdate:
+    """_fetch_data()'s regular poll only force-bypasses the LK API's own
+    backend cache for a Cubic Secure device's configuration (valveState,
+    firmwareVersion, ...) once that cache looks older than the poll
+    interval - decoupled from whether a write actually just happened. A
+    write-triggered refresh (e.g. valve.py after open/close) needs its
+    own, unconditionally-forced fetch instead, or it can keep serving the
+    same stale cached snapshot.
+    """
+
+    async def test_success_updates_stored_configuration(self, hass, fake_manager):
+        entry = _make_entry(hass)
+        coordinator = LKSystemCoordinator(hass, entry)
+
+        with _patch_manager(fake_manager):
+            data = await coordinator._async_update_data()
+        coordinator.async_set_updated_data(data)
+
+        fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
+            build_cubic_configuration(valve_state="closed")
+        )
+
+        with _patch_manager(fake_manager):
+            result = await coordinator.force_cubic_secure_configuration_update(
+                CUBIC_IDENTITY
+            )
+
+        assert result is True
+        assert (
+            coordinator.data["cubic_devices"][CUBIC_IDENTITY]["configuration"][
+                "valveState"
+            ]
+            == "closed"
+        )
+
+    async def test_configuration_fetch_failure_returns_false(self, hass, fake_manager):
+        entry = _make_entry(hass)
+        coordinator = LKSystemCoordinator(hass, entry)
+        fake_manager.get_cubic_secure_configuration_result = False
+
+        with _patch_manager(fake_manager):
+            result = await coordinator.force_cubic_secure_configuration_update(
+                CUBIC_IDENTITY
+            )
+
+        assert result is False
+
+    async def test_bypasses_the_backend_cache_unlike_a_regular_refresh(
+        self, hass, fake_manager
+    ):
+        """Regression test for the actual bug this method exists to work
+        around: a regular refresh only escalates to force_update=True once
+        the cached response's own cacheUpdated timestamp looks older than
+        the poll interval - so right after a write, it can keep serving
+        the same pre-write cached snapshot.
+        """
+        entry = _make_entry(hass)
+        coordinator = LKSystemCoordinator(hass, entry)
+
+        with _patch_manager(fake_manager):
+            data = await coordinator._async_update_data()
+        coordinator.async_set_updated_data(data)
+
+        # The LK backend's own cache still serving a pre-write snapshot
+        # (a fresh cacheUpdated, so _fetch_data()'s own staleness check
+        # won't escalate to force_update=True on its own), while the
+        # force_update=True/"live" value already reflects a fresh write.
+        fake_manager.cubic_configurations_cached_by_device[CUBIC_IDENTITY] = (
+            build_cubic_configuration(valve_state="open")
+        )
+        fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
+            build_cubic_configuration(valve_state="closed")
+        )
+
+        with _patch_manager(fake_manager):
+            await coordinator.async_request_refresh()
+
+        assert (
+            coordinator.data["cubic_devices"][CUBIC_IDENTITY]["configuration"][
+                "valveState"
+            ]
+            == "open"
+        ), "a regular refresh should still be serving the stale cached value"
+
+        with _patch_manager(fake_manager):
+            result = await coordinator.force_cubic_secure_configuration_update(
+                CUBIC_IDENTITY
+            )
+
+        assert result is True
+        assert (
+            coordinator.data["cubic_devices"][CUBIC_IDENTITY]["configuration"][
+                "valveState"
+            ]
+            == "closed"
+        )
+
+    async def test_login_failure_returns_false(self, hass, fake_manager):
+        entry = _make_entry(hass)
+        coordinator = LKSystemCoordinator(hass, entry)
+        fake_manager.login_result = False
+
+        with _patch_manager(fake_manager):
+            result = await coordinator.force_cubic_secure_configuration_update(
+                CUBIC_IDENTITY
+            )
 
         assert result is False
 

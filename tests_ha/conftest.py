@@ -103,6 +103,12 @@ class FakeLKSystemsManager:
         # single-device tests can keep using the simpler singular fields.
         self.cubic_measurements_by_device: dict[str, dict] = {}
         self.cubic_configurations_by_device: dict[str, dict] = {}
+        # Per-device override for what get_cubic_secure_configuration returns
+        # when *not* force_update - distinct from cubic_configurations_by_device
+        # above (used otherwise, and always when force_update=True) - lets
+        # tests simulate the real API's own server-side cache (the bypass=0
+        # path) serving a stale snapshot independently of the live value.
+        self.cubic_configurations_cached_by_device: dict[str, dict] = {}
 
         # Configurable outcomes for each call, so tests can force failures.
         self.login_result = True
@@ -180,9 +186,19 @@ class FakeLKSystemsManager:
             ("get_cubic_secure_configuration", device_identity, force_update)
         )
         if self.get_cubic_secure_configuration_result:
-            self.cubic_secure_configuration = self.cubic_configurations_by_device.get(
-                device_identity, self.cubic_configuration_data
-            )
+            if (
+                not force_update
+                and device_identity in self.cubic_configurations_cached_by_device
+            ):
+                self.cubic_secure_configuration = (
+                    self.cubic_configurations_cached_by_device[device_identity]
+                )
+            else:
+                self.cubic_secure_configuration = (
+                    self.cubic_configurations_by_device.get(
+                        device_identity, self.cubic_configuration_data
+                    )
+                )
         return self.get_cubic_secure_configuration_result
 
     async def set_thermostat_temperature(self, device_id, temperature):
