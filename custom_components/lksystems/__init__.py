@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from typing import TypedDict
+from contextlib import asynccontextmanager
 from datetime import timedelta
 import asyncio
 import base64
@@ -21,6 +22,7 @@ from homeassistant.exceptions import HomeAssistantError, ConfigEntryAuthFailed
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.helpers.update_coordinator import (
@@ -58,7 +60,13 @@ _LOGGER = logging.getLogger(__name__)
 CONSECUTIVE_FAILURE_THRESHOLD = 3
 
 # Define the platforms we support
-PLATFORMS = [Platform.SENSOR, Platform.CLIMATE, Platform.NUMBER, Platform.BUTTON]
+PLATFORMS = [
+    Platform.SENSOR,
+    Platform.CLIMATE,
+    Platform.NUMBER,
+    Platform.BUTTON,
+    Platform.VALVE,
+]
 
 
 class LkStructureResp(TypedDict):
@@ -205,6 +213,11 @@ def is_token_valid(token: str) -> bool:
 
 # Type definitions for better type checking
 # LkStructureResp = Dict[str, Any]
+
+
+class _LoginFailed(Exception):
+    """Raised by LKSystemCoordinator._authenticated_client() when there's
+    no valid cached token and a fresh login attempt fails."""
 
 
 class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
@@ -402,6 +415,70 @@ class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
 
         except Exception as ex:
             _LOGGER.error("Error during forced device update: %s", ex)
+            return False
+
+    @asynccontextmanager
+    async def _authenticated_client(self):
+        """Yield a logged-in LKSystemsManager for a one-off API call,
+        reusing a still-valid stored token instead of always logging in
+        fresh. Raises _LoginFailed if there's no valid cached token and a
+        fresh login attempt fails.
+        """
+        username = self._entry.data.get(CONF_USERNAME)
+        password = self._entry.data.get(CONF_PASSWORD)
+
+        async with LKSystemsManager(username, password) as lk_inst:
+            stored_tokens = TOKEN_STORAGE.get(self._entry_id, {})
+            stored_jwt = stored_tokens.get("jwt")
+
+            if stored_jwt and is_token_valid(stored_jwt):
+                lk_inst.jwt_token = stored_jwt
+                lk_inst.refresh_token = stored_tokens.get("refresh")
+            else:
+                if not await lk_inst.login():
+                    raise _LoginFailed()
+
+                TOKEN_STORAGE[self._entry_id] = {
+                    "jwt": lk_inst.jwt_token,
+                    "refresh": lk_inst.refresh_token,
+                    "expiry": dt_util.utcnow().timestamp() + 3600,
+                }
+
+            yield lk_inst
+
+    async def force_cubic_secure_configuration_update(self, device_identity: str) -> bool:
+        """Force-fetch one Cubic Secure device's configuration, bypassing
+        the LK API's own backend cache.
+
+        The regular poll (_fetch_data) only bypasses that cache once its
+        own cacheUpdated timestamp looks older than the poll interval -
+        decoupled from whether a write just happened, so it can't be
+        relied on to reflect a write promptly. Callers that just wrote
+        (e.g. valve.py after open/close) need this instead.
+        """
+        _LOGGER.debug(
+            "Forcing configuration update for Cubic Secure device %s", device_identity
+        )
+
+        try:
+            async with self._authenticated_client() as lk_inst:
+                success = await lk_inst.get_cubic_secure_configuration(
+                    device_identity, force_update=True
+                )
+
+                if success and self.data:
+                    self.data["cubic_devices"][device_identity]["configuration"] = (
+                        lk_inst.cubic_secure_configuration
+                    )
+                    self.async_set_updated_data(self.data)
+
+                return success
+
+        except _LoginFailed:
+            _LOGGER.error("Login failed when forcing configuration update")
+            return False
+        except Exception as ex:
+            _LOGGER.error("Error forcing Cubic Secure configuration update: %s", ex)
             return False
 
     async def _async_update_data(self) -> LkStructureResp:
@@ -833,6 +910,48 @@ class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
 def cubic_secure_device_identities(coordinator: LKSystemCoordinator) -> list[str]:
     """Return the device identities of every Cubic Secure device on the account."""
     return list(coordinator.data.get("cubic_devices", {}))
+
+
+def cubic_secure_configuration(
+    coordinator: LKSystemCoordinator, device_identity: str
+) -> dict[str, Any]:
+    """Return a Cubic Secure device's last-fetched configuration dict.
+
+    Configuration (valveState, firmwareVersion, ...) is fetched
+    separately from measurement data and can fail independently, so this
+    is always defensive about it being missing.
+    """
+    cubic_device = coordinator.data["cubic_devices"][device_identity]
+    return cubic_device.get("configuration") or {}
+
+
+async def async_call_cubic_secure_service(
+    hass: HomeAssistant,
+    device_identity: str,
+    service: str,
+    extra_data: dict[str, Any] | None = None,
+) -> bool:
+    """Resolve a Cubic Secure device identity to its registered device and
+    call one of this integration's own services on it.
+
+    Shared by every platform whose action is "call an existing lksystems
+    service for this device" (button.py, valve.py, ...), so the device
+    lookup and its "not registered" error handling exist in one place.
+    Returns whether the service was actually called.
+    """
+    device_entry = dr.async_get(hass).async_get_device(
+        identifiers={(DOMAIN, device_identity)}
+    )
+    if device_entry is None:
+        _LOGGER.error(
+            "No registered device found for %s, cannot call %s", device_identity, service
+        )
+        return False
+
+    await hass.services.async_call(
+        DOMAIN, service, {"device_id": device_entry.id, **(extra_data or {})}, blocking=True
+    )
+    return True
 
 
 def cubic_secure_device_info(

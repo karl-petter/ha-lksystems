@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from contextlib import contextmanager
 from unittest.mock import patch
 
 import pytest
@@ -102,6 +103,12 @@ class FakeLKSystemsManager:
         # single-device tests can keep using the simpler singular fields.
         self.cubic_measurements_by_device: dict[str, dict] = {}
         self.cubic_configurations_by_device: dict[str, dict] = {}
+        # Per-device override for what get_cubic_secure_configuration returns
+        # when *not* force_update - distinct from cubic_configurations_by_device
+        # above (used otherwise, and always when force_update=True) - lets
+        # tests simulate the real API's own server-side cache (the bypass=0
+        # path) serving a stale snapshot independently of the live value.
+        self.cubic_configurations_cached_by_device: dict[str, dict] = {}
 
         # Configurable outcomes for each call, so tests can force failures.
         self.login_result = True
@@ -179,9 +186,19 @@ class FakeLKSystemsManager:
             ("get_cubic_secure_configuration", device_identity, force_update)
         )
         if self.get_cubic_secure_configuration_result:
-            self.cubic_secure_configuration = self.cubic_configurations_by_device.get(
-                device_identity, self.cubic_configuration_data
-            )
+            if (
+                not force_update
+                and device_identity in self.cubic_configurations_cached_by_device
+            ):
+                self.cubic_secure_configuration = (
+                    self.cubic_configurations_cached_by_device[device_identity]
+                )
+            else:
+                self.cubic_secure_configuration = (
+                    self.cubic_configurations_by_device.get(
+                        device_identity, self.cubic_configuration_data
+                    )
+                )
         return self.get_cubic_secure_configuration_result
 
     async def set_thermostat_temperature(self, device_id, temperature):
@@ -430,6 +447,12 @@ def entity_id(hass, platform: str, unique_id: str) -> str:
     return found
 
 
+def patch_coordinator_manager(manager: FakeLKSystemsManager):
+    """Patch the LKSystemsManager the coordinator itself constructs
+    (setup, polling refresh)."""
+    return patch("custom_components.lksystems.LKSystemsManager", return_value=manager)
+
+
 def patch_services_manager(manager: FakeLKSystemsManager):
     """Patch the LKSystemsManager used by services.py's own handlers.
 
@@ -442,6 +465,21 @@ def patch_services_manager(manager: FakeLKSystemsManager):
     return patch(
         "custom_components.lksystems.services.LKSystemsManager", return_value=manager
     )
+
+
+@contextmanager
+def patch_all_managers(manager: FakeLKSystemsManager):
+    """Patch every place LKSystemsManager gets constructed: the coordinator
+    (its polling refresh) and services.py (service handlers).
+
+    patch_services_manager() alone only covers a service call itself;
+    needed on top of that by anything that also triggers a coordinator
+    refresh in the same action (e.g. valve.py's open/close), since that
+    refresh would otherwise fall through to a real, unpatched
+    LKSystemsManager and attempt a genuine network call.
+    """
+    with patch_coordinator_manager(manager), patch_services_manager(manager):
+        yield
 
 
 @pytest.fixture
@@ -473,7 +511,7 @@ async def setup_entry(
         options=options or {},
     )
     entry.add_to_hass(hass)
-    with patch("custom_components.lksystems.LKSystemsManager", return_value=manager):
+    with patch_coordinator_manager(manager):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
     return entry
