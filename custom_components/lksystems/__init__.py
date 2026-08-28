@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from typing import TypedDict
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 import asyncio
 import base64
@@ -20,7 +21,9 @@ except ImportError:
 from homeassistant.exceptions import HomeAssistantError, ConfigEntryAuthFailed
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant
+from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.event import async_track_point_in_time
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
@@ -30,7 +33,15 @@ from homeassistant.util import dt as dt_util
 import voluptuous as vol
 from homeassistant.helpers import config_validation as cv
 
-from .const import CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL, DOMAIN
+from .const import (
+    CONF_UPDATE_INTERVAL,
+    CUBIC_SECURE_MODEL,
+    DEFAULT_UPDATE_INTERVAL,
+    DOMAIN,
+    LEAK_DETECTION_EXPIRY_MAX_RETRY_SECONDS,
+    LEAK_DETECTION_EXPIRY_RETRY_INTERVAL_SECONDS,
+    MANUFACTURER,
+)
 from .pylksystems import (
     LKSystemsManager,
     LKSystemsError,
@@ -51,7 +62,7 @@ _LOGGER = logging.getLogger(__name__)
 CONSECUTIVE_FAILURE_THRESHOLD = 3
 
 # Define the platforms we support
-PLATFORMS = [Platform.SENSOR, Platform.CLIMATE]
+PLATFORMS = [Platform.SENSOR, Platform.CLIMATE, Platform.NUMBER, Platform.BUTTON]
 
 
 class LkStructureResp(TypedDict):
@@ -200,6 +211,22 @@ def is_token_valid(token: str) -> bool:
 # LkStructureResp = Dict[str, Any]
 
 
+class _LoginFailed(Exception):
+    """Raised by LKSystemCoordinator._authenticated_client() when there's
+    no valid cached token and a fresh login attempt fails."""
+
+
+def _round_to_nearest_minute(moment: datetime) -> datetime:
+    """Round a datetime to the nearest whole minute.
+
+    LK's own API has slop of up to ~90 seconds around when a pause
+    actually starts or ends - confirmed empirically against the real API -
+    so a second-precision "paused until" value would claim an accuracy the
+    underlying system doesn't have.
+    """
+    return (moment + timedelta(seconds=30)).replace(second=0, microsecond=0)
+
+
 class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
     """Data update coordinator for LK Systems."""
 
@@ -230,6 +257,32 @@ class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
         self.last_successful_cloud_fetch: datetime | None = None
         self._consecutive_failures = 0
 
+        # How long the next "Pause Leak Detection" button press should pause
+        # for, per Cubic Secure device serial number. A local preference
+        # (not fetched from the API), set by number.py and read by
+        # button.py.
+        self.pause_leak_detection_seconds: dict[str, int] = {}
+
+        # When leak detection will resume for a paused Cubic Secure device,
+        # per device serial number - absent when not currently paused. The
+        # API's own muteLeak field doesn't decrement between polls and
+        # isn't a live countdown - confirmed empirically against the real
+        # API - so this is computed and tracked locally instead: set
+        # explicitly by set_leak_detection_paused_until() right after HA
+        # itself issues a pause/resume, and kept in sync with pauses/
+        # cancellations from elsewhere (e.g. the LK app) by
+        # _reconcile_leak_detection_paused_until() on every cached
+        # configuration fetch.
+        self.leak_detection_paused_until: dict[str, datetime] = {}
+
+        # Cancel handle for each device's pending
+        # _schedule_leak_detection_expiry_refresh() call, if any - reaching
+        # a target end time isn't itself an event anything reacts to, so
+        # without this, leak_detection_paused_until would just sit on a
+        # stale value until the next regular poll (up to a full
+        # update_interval later) picked up the change.
+        self._leak_detection_refresh_unsub: dict[str, CALLBACK_TYPE] = {}
+
         # Initialize coordinator with update interval
         super().__init__(
             hass,
@@ -237,6 +290,17 @@ class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
             name=DOMAIN,
             update_interval=timedelta(minutes=update_interval_minutes),
         )
+
+    @property
+    def entry(self) -> ConfigEntry:
+        """Return the config entry this coordinator was set up from.
+
+        Lets entities that need it (to call an API function directly,
+        outside the coordinator's own methods) reach it through the
+        coordinator they already hold, rather than each entity taking and
+        storing its own separate copy.
+        """
+        return self._entry
 
     async def set_thermostat_temperature(self, device_id, temperature):
         """Set thermostat temperature through the API.
@@ -391,6 +455,252 @@ class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
         except Exception as ex:
             _LOGGER.error("Error during forced device update: %s", ex)
             return False
+
+    @asynccontextmanager
+    async def _authenticated_client(self):
+        """Yield a logged-in LKSystemsManager for a one-off API call,
+        reusing a still-valid stored token instead of always logging in
+        fresh. Raises _LoginFailed if there's no valid cached token and a
+        fresh login attempt fails.
+        """
+        username = self._entry.data.get(CONF_USERNAME)
+        password = self._entry.data.get(CONF_PASSWORD)
+
+        async with LKSystemsManager(username, password) as lk_inst:
+            stored_tokens = TOKEN_STORAGE.get(self._entry_id, {})
+            stored_jwt = stored_tokens.get("jwt")
+
+            if stored_jwt and is_token_valid(stored_jwt):
+                lk_inst.jwt_token = stored_jwt
+                lk_inst.refresh_token = stored_tokens.get("refresh")
+            else:
+                if not await lk_inst.login():
+                    raise _LoginFailed()
+
+                TOKEN_STORAGE[self._entry_id] = {
+                    "jwt": lk_inst.jwt_token,
+                    "refresh": lk_inst.refresh_token,
+                    "expiry": dt_util.utcnow().timestamp() + 3600,
+                }
+
+            yield lk_inst
+
+    def _pause_end_time(self, seconds: int) -> datetime:
+        """Return the (rounded) wall-clock time `seconds` from now."""
+        return _round_to_nearest_minute(dt_util.utcnow() + timedelta(seconds=seconds))
+
+    def _clear_leak_detection_paused_until(self, device_identity: str) -> None:
+        """Stop tracking a device as paused, and cancel any pending expiry
+        check for it - shared by an explicit resume and by reconciliation
+        learning the cloud considers it over."""
+        self.leak_detection_paused_until.pop(device_identity, None)
+        self._cancel_leak_detection_expiry_refresh(device_identity)
+
+    def _adopt_leak_detection_target(self, device_identity: str, seconds: int) -> None:
+        """Start tracking a device as paused for `seconds` from now, and
+        schedule its expiry check - shared by an explicit pause and by
+        reconciliation adopting one HA didn't itself start."""
+        target = self._pause_end_time(seconds)
+        self.leak_detection_paused_until[device_identity] = target
+        self._schedule_leak_detection_expiry_refresh(device_identity, target)
+
+    def set_leak_detection_paused_until(
+        self, device_identity: str, seconds: int
+    ) -> None:
+        """Set (or, for seconds=0, clear) a device's locally tracked pause
+        end time, right after HA itself issues a pause/resume that the API
+        call confirmed succeeded.
+
+        Takes effect immediately rather than waiting for
+        _reconcile_leak_detection_paused_until() to pick it up off the next
+        poll, and - for a re-pause while already active - overwrites the
+        previous target rather than leaving it in place, matching the real
+        API's reset-not-stack behavior (confirmed empirically).
+        """
+        if not seconds:
+            self._clear_leak_detection_paused_until(device_identity)
+            return
+        self._adopt_leak_detection_target(device_identity, seconds)
+
+    def _reconcile_leak_detection_paused_until(
+        self, device_identity: str, configuration: dict
+    ) -> None:
+        """Keep the locally tracked pause end time in sync with a pause
+        HA didn't itself just set - one started or cancelled from
+        elsewhere (e.g. the LK app), or one that expired naturally.
+
+        Only ever clears an untracked device or adopts a fresh target for
+        one that isn't tracked yet; never overwrites an already-tracked
+        target, since muteLeak can't tell a still-ongoing pause apart from
+        a brand new one started for a different duration - only
+        set_leak_detection_paused_until() (an explicit request HA itself
+        just made) may do that.
+        """
+        mute_leak_seconds = configuration.get("muteLeak")
+        if not mute_leak_seconds:
+            self._clear_leak_detection_paused_until(device_identity)
+            return
+        if device_identity not in self.leak_detection_paused_until:
+            self._adopt_leak_detection_target(device_identity, mute_leak_seconds)
+
+    def _schedule_leak_detection_expiry_refresh(
+        self, device_identity: str, target: datetime
+    ) -> None:
+        """Poll the cloud starting at a pause's target end time, retrying
+        every LEAK_DETECTION_EXPIRY_RETRY_INTERVAL_SECONDS until it
+        confirms the pause is actually over, so leak_detection_paused_until
+        clears promptly instead of sitting on a stale value until the next
+        regular poll. Gives up after LEAK_DETECTION_EXPIRY_MAX_RETRY_SECONDS
+        and leaves it to that regular poll instead.
+        """
+        self._cancel_leak_detection_expiry_refresh(device_identity)
+        retry_deadline = target + timedelta(
+            seconds=LEAK_DETECTION_EXPIRY_MAX_RETRY_SECONDS
+        )
+
+        def _track_at(when: datetime) -> None:
+            self._leak_detection_refresh_unsub[device_identity] = (
+                async_track_point_in_time(self.hass, _check_if_expired, when)
+            )
+
+        async def _check_if_expired(now: datetime) -> None:
+            self._leak_detection_refresh_unsub.pop(device_identity, None)
+            if not await self.refresh_cubic_secure_configuration(device_identity):
+                return
+            configuration = self.data["cubic_devices"][device_identity][
+                "configuration"
+            ]
+            self._reconcile_leak_detection_paused_until(device_identity, configuration)
+            # refresh_cubic_secure_configuration() above already notified
+            # listeners once, before this reconcile ran - entities reading
+            # leak_detection_paused_until (the Resume button, the "Leak
+            # Detection Paused Until" sensor) need a second notification to
+            # pick up what it just changed, or they're stuck showing the
+            # pre-reconcile state until the next regular poll.
+            self.async_update_listeners()
+
+            if device_identity not in self.leak_detection_paused_until:
+                # Logged at debug rather than left silent so how long the
+                # cloud actually lags past a pause's nominal end is
+                # observable from real usage over time, not just the one
+                # sample this was originally tuned from.
+                _LOGGER.debug(
+                    "Leak detection expiry for %s confirmed %s past its target",
+                    device_identity,
+                    now - target,
+                )
+                return
+            if now >= retry_deadline:
+                _LOGGER.debug(
+                    "Giving up on leak detection expiry checks for %s after %s - "
+                    "leaving it to the regular poll",
+                    device_identity,
+                    now - target,
+                )
+                return  # give up - the regular poll will pick it up eventually
+
+            _track_at(now + timedelta(seconds=LEAK_DETECTION_EXPIRY_RETRY_INTERVAL_SECONDS))
+
+        _track_at(target)
+
+    def _cancel_leak_detection_expiry_refresh(self, device_identity: str) -> None:
+        """Cancel a device's pending expiry check, if one is scheduled."""
+        if unsub := self._leak_detection_refresh_unsub.pop(device_identity, None):
+            unsub()
+
+    async def async_shutdown(self) -> None:
+        """Cancel any scheduled call, and ignore new runs.
+
+        Also cancels every pending leak-detection expiry check - they'd
+        otherwise fire against a torn-down coordinator after unload.
+        """
+        await super().async_shutdown()
+        for device_identity in list(self._leak_detection_refresh_unsub):
+            self._cancel_leak_detection_expiry_refresh(device_identity)
+
+    async def _update_cubic_secure_configuration(
+        self, device_identity: str, *, force_update: bool
+    ) -> bool:
+        """Fetch one Cubic Secure device's configuration and publish it.
+
+        Shared implementation for the two variants below - see their own
+        docstrings for which to use when.
+        """
+        try:
+            async with self._authenticated_client() as lk_inst:
+                success = await lk_inst.get_cubic_secure_configuration(
+                    device_identity, force_update=force_update
+                )
+
+                if success and self.data:
+                    self.data["cubic_devices"][device_identity]["configuration"] = (
+                        lk_inst.cubic_secure_configuration
+                    )
+                    # Deliberately doesn't call
+                    # _reconcile_leak_detection_paused_until() here: some
+                    # callers of this method (a pause/resume, an
+                    # open/close) reach it right after HA itself just
+                    # wrote something, and the cached response can still
+                    # be serving a pre-write snapshot for tens of seconds
+                    # - confirmed empirically against the real API -
+                    # reconciling off it there would race the explicit
+                    # set_leak_detection_paused_until() call the caller
+                    # already made and undo it. Reconciliation instead
+                    # happens at each call site once it's independently
+                    # established that enough time has passed for the
+                    # cached read to be trustworthy: the regular poll
+                    # (_fetch_data) isn't tied to a just-made write, and
+                    # the leak-detection expiry check
+                    # (_schedule_leak_detection_expiry_refresh) only ever
+                    # calls this at or after a pause's own target end time.
+                    self.async_set_updated_data(self.data)
+
+                return success
+
+        except _LoginFailed:
+            _LOGGER.error("Login failed when updating Cubic Secure configuration")
+            return False
+        except Exception as ex:
+            _LOGGER.error("Error updating Cubic Secure configuration: %s", ex)
+            return False
+
+    async def force_cubic_secure_configuration_update(self, device_identity: str) -> bool:
+        """Force-fetch one Cubic Secure device's configuration, bypassing
+        the LK API's own backend cache.
+
+        The regular poll (_fetch_data) only bypasses that cache once its
+        own cacheUpdated timestamp looks older than the poll interval -
+        decoupled from whether a write just happened, so it can't be
+        relied on to reflect a write promptly. Callers that just wrote a
+        physical device property (e.g. opening/closing the valve) need
+        this instead. Don't use this for server-side-tracked fields like
+        muteLeak - see refresh_cubic_secure_configuration().
+        """
+        _LOGGER.debug(
+            "Forcing configuration update for Cubic Secure device %s", device_identity
+        )
+        return await self._update_cubic_secure_configuration(
+            device_identity, force_update=True
+        )
+
+    async def refresh_cubic_secure_configuration(self, device_identity: str) -> bool:
+        """Fetch one Cubic Secure device's configuration via the LK API's
+        own cache (not bypassed).
+
+        Confirmed empirically against the real API: for server-side-
+        tracked fields like muteLeak, this cached read is the fresher
+        one - force_cubic_secure_configuration_update()'s bypass polls
+        the physical device live and doesn't carry server-managed timers
+        like muteLeak at all, while this cached snapshot updates
+        immediately on a write (e.g. button.py after pausing leak
+        detection).
+        """
+        _LOGGER.debug(
+            "Refreshing configuration for Cubic Secure device %s", device_identity
+        )
+        return await self._update_cubic_secure_configuration(
+            device_identity, force_update=False
+        )
 
     async def _async_update_data(self) -> LkStructureResp:
         """Fetch the latest data, surfacing persistent failures as repair issues.
@@ -666,6 +976,19 @@ class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
                                         _LOGGER.debug(
                                             "Cubic secure configuration is older than update interval, force update"
                                         )
+                                        # The forced/bypass fetch below polls
+                                        # the physical device live rather
+                                        # than LK's backend cache, and the
+                                        # device doesn't report muteLeak at
+                                        # all - carry the cached value over
+                                        # so this staleness-triggered force
+                                        # doesn't wipe out a pause that's
+                                        # still running.
+                                        cached_mute_leak = (
+                                            lk_inst.cubic_secure_configuration.get(
+                                                "muteLeak"
+                                            )
+                                        )
                                         if not await lk_inst.get_cubic_secure_configuration(
                                             device_identity, force_update=True
                                         ):
@@ -675,10 +998,16 @@ class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
                                             raise UpdateFailed(
                                                 "Unknown error get_cubic_secure_configuration"
                                             )
+                                        lk_inst.cubic_secure_configuration.setdefault(
+                                            "muteLeak", cached_mute_leak
+                                        )
 
                                 resp["cubic_devices"][device_identity][
                                     "configuration"
                                 ] = lk_inst.cubic_secure_configuration
+                                self._reconcile_leak_detection_paused_until(
+                                    device_identity, lk_inst.cubic_secure_configuration
+                                )
                             except Exception as err:
                                 # Sensors index these keys directly, so they
                                 # must exist even on failure; reuse this
@@ -820,6 +1149,30 @@ class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
             raise UpdateFailed(str(err)) from err
 
 
+def cubic_secure_device_identities(coordinator: LKSystemCoordinator) -> list[str]:
+    """Return the device identities of every Cubic Secure device on the account."""
+    return list(coordinator.data.get("cubic_devices", {}))
+
+
+def cubic_secure_device_info(
+    coordinator: LKSystemCoordinator, device_identity: str
+) -> DeviceInfo:
+    """Build the shared DeviceInfo for a Cubic Secure device.
+
+    Every platform with an entity on a Cubic Secure device (sensor,
+    number, button, ...) calls this, so they all resolve to the same HA
+    device instead of each building their own copy.
+    """
+    machine_info = coordinator.data["cubic_devices"][device_identity]["machine_info"]
+    return DeviceInfo(
+        identifiers={(DOMAIN, device_identity)},
+        manufacturer=MANUFACTURER,
+        model=CUBIC_SECURE_MODEL,
+        name=f"Cubic Secure {machine_info['zone']['zoneName']}",
+        serial_number=device_identity,
+    )
+
+
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the LK Systems component."""
     hass.data[DOMAIN] = {}
@@ -912,6 +1265,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
     if unload_ok:
+        # Cancels any pending leak-detection expiry checks, on top of the
+        # coordinator's own polling - see LKSystemCoordinator.async_shutdown().
+        await hass.data[DOMAIN][entry.entry_id].async_shutdown()
+
         # Clear token from cache on unload
         TOKEN_STORAGE.pop(entry.entry_id, None)
         hass.data[DOMAIN].pop(entry.entry_id)

@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import time
 from datetime import timedelta
 from unittest.mock import AsyncMock, patch
 
@@ -20,7 +21,10 @@ from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.update_coordinator import UpdateFailed
 from homeassistant.util import dt as dt_util
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    async_fire_time_changed,
+)
 
 from custom_components.lksystems import (
     TOKEN_STORAGE,
@@ -31,6 +35,8 @@ from custom_components.lksystems.const import (
     CONF_UPDATE_INTERVAL,
     DEFAULT_UPDATE_INTERVAL,
     DOMAIN,
+    LEAK_DETECTION_EXPIRY_MAX_RETRY_SECONDS,
+    LEAK_DETECTION_EXPIRY_RETRY_INTERVAL_SECONDS,
 )
 from custom_components.lksystems.repairs import _issue_id
 
@@ -41,6 +47,8 @@ from .conftest import (
     HUB_IDENTITY,
     SENSOR_MAC,
     THERMOSTAT_MAC,
+    build_cubic_configuration,
+    build_live_config_without_mute_leak,
     get_issue,
 )
 
@@ -392,6 +400,36 @@ class TestCubicFetchFailureFallback:
         )
 
 
+class TestCubicConfigurationStalenessForceFetch:
+
+    async def test_preserves_mute_leak_across_a_staleness_triggered_force_fetch(
+        self, hass, fake_manager
+    ):
+        entry = _make_entry(hass)
+        coordinator = LKSystemCoordinator(hass, entry)
+
+        stale_cache_updated = (
+            int(time.time()) - int(coordinator.update_interval.total_seconds()) - 60
+        )
+        cached_config = build_cubic_configuration(mute_leak=1200)
+        cached_config["cacheUpdated"] = stale_cache_updated
+        fake_manager.cubic_configurations_cached_by_device[CUBIC_IDENTITY] = (
+            cached_config
+        )
+
+        fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
+            build_live_config_without_mute_leak()
+        )
+
+        with _patch_manager(fake_manager):
+            data = await coordinator._async_update_data()
+
+        assert (
+            data["cubic_devices"][CUBIC_IDENTITY]["configuration"]["muteLeak"] == 1200
+        )
+        await coordinator.async_shutdown()  # cancel the expiry check this adopted
+
+
 class TestMultipleCubicSecureDevices:
     """Two Cubic Secure devices registered under the same property used to
     stomp on each other, since the coordinator kept a single unkeyed slot
@@ -482,6 +520,517 @@ class TestForceDeviceUpdate:
             result = await coordinator.force_device_update(THERMOSTAT_MAC)
 
         assert result is False
+
+
+class TestForceCubicSecureConfigurationUpdate:
+    """_fetch_data()'s regular poll only force-bypasses the LK API's own
+    backend cache for a Cubic Secure device's configuration (valveState,
+    firmwareVersion, ...) once that cache looks older than the poll
+    interval - decoupled from whether a write actually just happened. A
+    write-triggered refresh (e.g. valve.py after open/close) needs its
+    own, unconditionally-forced fetch instead, or it can keep serving the
+    same stale cached snapshot.
+    """
+
+    async def test_success_updates_stored_configuration(self, hass, fake_manager):
+        entry = _make_entry(hass)
+        coordinator = LKSystemCoordinator(hass, entry)
+
+        with _patch_manager(fake_manager):
+            data = await coordinator._async_update_data()
+        coordinator.async_set_updated_data(data)
+
+        fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
+            build_cubic_configuration(valve_state="closed")
+        )
+
+        with _patch_manager(fake_manager):
+            result = await coordinator.force_cubic_secure_configuration_update(
+                CUBIC_IDENTITY
+            )
+
+        assert result is True
+        assert (
+            coordinator.data["cubic_devices"][CUBIC_IDENTITY]["configuration"][
+                "valveState"
+            ]
+            == "closed"
+        )
+
+    async def test_configuration_fetch_failure_returns_false(self, hass, fake_manager):
+        entry = _make_entry(hass)
+        coordinator = LKSystemCoordinator(hass, entry)
+        fake_manager.get_cubic_secure_configuration_result = False
+
+        with _patch_manager(fake_manager):
+            result = await coordinator.force_cubic_secure_configuration_update(
+                CUBIC_IDENTITY
+            )
+
+        assert result is False
+
+    async def test_bypasses_the_backend_cache_unlike_a_regular_refresh(
+        self, hass, fake_manager
+    ):
+        """Regression test for the actual bug this method exists to work
+        around: a regular refresh only escalates to force_update=True once
+        the cached response's own cacheUpdated timestamp looks older than
+        the poll interval - so right after a write, it can keep serving
+        the same pre-write cached snapshot.
+        """
+        entry = _make_entry(hass)
+        coordinator = LKSystemCoordinator(hass, entry)
+
+        with _patch_manager(fake_manager):
+            data = await coordinator._async_update_data()
+        coordinator.async_set_updated_data(data)
+
+        # The LK backend's own cache still serving a pre-write snapshot
+        # (a fresh cacheUpdated, so _fetch_data()'s own staleness check
+        # won't escalate to force_update=True on its own), while the
+        # force_update=True/"live" value already reflects a fresh write.
+        fake_manager.cubic_configurations_cached_by_device[CUBIC_IDENTITY] = (
+            build_cubic_configuration(valve_state="open")
+        )
+        fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
+            build_cubic_configuration(valve_state="closed")
+        )
+
+        with _patch_manager(fake_manager):
+            await coordinator.async_request_refresh()
+
+        assert (
+            coordinator.data["cubic_devices"][CUBIC_IDENTITY]["configuration"][
+                "valveState"
+            ]
+            == "open"
+        ), "a regular refresh should still be serving the stale cached value"
+
+        with _patch_manager(fake_manager):
+            result = await coordinator.force_cubic_secure_configuration_update(
+                CUBIC_IDENTITY
+            )
+
+        assert result is True
+        assert (
+            coordinator.data["cubic_devices"][CUBIC_IDENTITY]["configuration"][
+                "valveState"
+            ]
+            == "closed"
+        )
+
+    async def test_login_failure_returns_false(self, hass, fake_manager):
+        entry = _make_entry(hass)
+        coordinator = LKSystemCoordinator(hass, entry)
+        fake_manager.login_result = False
+
+        with _patch_manager(fake_manager):
+            result = await coordinator.force_cubic_secure_configuration_update(
+                CUBIC_IDENTITY
+            )
+
+        assert result is False
+
+
+class TestRefreshCubicSecureConfiguration:
+    """See refresh_cubic_secure_configuration()'s own docstring for why
+    this reads the cached response rather than bypassing it."""
+
+    async def test_success_updates_stored_configuration(self, hass, fake_manager):
+        entry = _make_entry(hass)
+        coordinator = LKSystemCoordinator(hass, entry)
+
+        with _patch_manager(fake_manager):
+            data = await coordinator._async_update_data()
+        coordinator.async_set_updated_data(data)
+
+        fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
+            build_cubic_configuration(valve_state="closed")
+        )
+
+        with _patch_manager(fake_manager):
+            result = await coordinator.refresh_cubic_secure_configuration(
+                CUBIC_IDENTITY
+            )
+
+        assert result is True
+        assert (
+            coordinator.data["cubic_devices"][CUBIC_IDENTITY]["configuration"][
+                "valveState"
+            ]
+            == "closed"
+        )
+
+    async def test_reads_the_cached_value_unlike_a_forced_fetch(
+        self, hass, fake_manager
+    ):
+        entry = _make_entry(hass)
+        coordinator = LKSystemCoordinator(hass, entry)
+
+        with _patch_manager(fake_manager):
+            data = await coordinator._async_update_data()
+        coordinator.async_set_updated_data(data)
+
+        # The cached (force_update=False) response and the "live"
+        # (force_update=True) one deliberately disagree here, so the two
+        # coordinator methods are distinguishable by which one they read.
+        fake_manager.cubic_configurations_cached_by_device[CUBIC_IDENTITY] = (
+            build_cubic_configuration(valve_state="open")
+        )
+        fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
+            build_cubic_configuration(valve_state="closed")
+        )
+
+        with _patch_manager(fake_manager):
+            result = await coordinator.refresh_cubic_secure_configuration(
+                CUBIC_IDENTITY
+            )
+
+        assert result is True
+        assert (
+            coordinator.data["cubic_devices"][CUBIC_IDENTITY]["configuration"][
+                "valveState"
+            ]
+            == "open"
+        )
+
+    async def test_configuration_fetch_failure_returns_false(self, hass, fake_manager):
+        entry = _make_entry(hass)
+        coordinator = LKSystemCoordinator(hass, entry)
+        fake_manager.get_cubic_secure_configuration_result = False
+
+        with _patch_manager(fake_manager):
+            result = await coordinator.refresh_cubic_secure_configuration(
+                CUBIC_IDENTITY
+            )
+
+        assert result is False
+
+    async def test_login_failure_returns_false(self, hass, fake_manager):
+        entry = _make_entry(hass)
+        coordinator = LKSystemCoordinator(hass, entry)
+        fake_manager.login_result = False
+
+        with _patch_manager(fake_manager):
+            result = await coordinator.refresh_cubic_secure_configuration(
+                CUBIC_IDENTITY
+            )
+
+        assert result is False
+
+
+class TestLeakDetectionPausedUntilTracking:
+    """See LKSystemCoordinator.leak_detection_paused_until's own docstring
+    for why it's tracked locally instead of recomputed from muteLeak on
+    every poll."""
+
+    async def test_set_rounds_to_the_nearest_minute(self, hass):
+        entry = _make_entry(hass)
+        coordinator = LKSystemCoordinator(hass, entry)
+
+        before = dt_util.utcnow()
+        coordinator.set_leak_detection_paused_until(CUBIC_IDENTITY, 130)
+        target = coordinator.leak_detection_paused_until[CUBIC_IDENTITY]
+
+        assert target.second == 0 and target.microsecond == 0
+        assert abs((target - (before + timedelta(seconds=130))).total_seconds()) <= 30
+        await coordinator.async_shutdown()  # cancel the scheduled expiry check
+
+    async def test_set_with_zero_seconds_clears_it(self, hass):
+        entry = _make_entry(hass)
+        coordinator = LKSystemCoordinator(hass, entry)
+        coordinator.set_leak_detection_paused_until(CUBIC_IDENTITY, 900)
+
+        coordinator.set_leak_detection_paused_until(CUBIC_IDENTITY, 0)
+
+        assert CUBIC_IDENTITY not in coordinator.leak_detection_paused_until
+
+    async def test_regular_poll_adopts_a_pause_ha_did_not_itself_start(
+        self, hass, fake_manager
+    ):
+        """E.g. one started from the LK app instead of an HA button/service."""
+        entry = _make_entry(hass)
+        coordinator = LKSystemCoordinator(hass, entry)
+        fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
+            build_cubic_configuration(mute_leak=900)
+        )
+
+        with _patch_manager(fake_manager):
+            await coordinator._async_update_data()
+
+        assert CUBIC_IDENTITY in coordinator.leak_detection_paused_until
+        await coordinator.async_shutdown()  # cancel the scheduled expiry check
+
+    async def test_regular_poll_clears_it_once_the_cloud_reports_inactive(
+        self, hass, fake_manager
+    ):
+        """Covers both natural expiry and a cancel issued from elsewhere
+        (e.g. the LK app's own "Stop" action) - either way, the cloud
+        reporting muteLeak=0 is what HA learns it from."""
+        entry = _make_entry(hass)
+        coordinator = LKSystemCoordinator(hass, entry)
+        coordinator.set_leak_detection_paused_until(CUBIC_IDENTITY, 900)
+        fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
+            build_cubic_configuration(mute_leak=0)
+        )
+
+        with _patch_manager(fake_manager):
+            await coordinator._async_update_data()
+
+        assert CUBIC_IDENTITY not in coordinator.leak_detection_paused_until
+
+    async def test_regular_poll_does_not_override_an_already_tracked_target(
+        self, hass, fake_manager
+    ):
+        """muteLeak is a static number, not a live countdown - re-deriving
+        a target from it on every poll would make the displayed time drift
+        later and later. Once a target is tracked, only an explicit
+        set_leak_detection_paused_until() call (a fresh pause/resume HA
+        itself issued) may change it - not the passive reconciliation a
+        regular poll does."""
+        entry = _make_entry(hass)
+        coordinator = LKSystemCoordinator(hass, entry)
+        coordinator.set_leak_detection_paused_until(CUBIC_IDENTITY, 900)
+        original_target = coordinator.leak_detection_paused_until[CUBIC_IDENTITY]
+        fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
+            build_cubic_configuration(mute_leak=1)
+        )
+
+        with _patch_manager(fake_manager):
+            await coordinator._async_update_data()
+
+        assert coordinator.leak_detection_paused_until[CUBIC_IDENTITY] == original_target
+        await coordinator.async_shutdown()  # cancel the scheduled expiry check
+
+    async def test_forced_live_fetch_does_not_touch_local_tracking(
+        self, hass, fake_manager
+    ):
+        """The live/bypass fetch doesn't reliably carry muteLeak at all
+        (see force_cubic_secure_configuration_update's own docstring) - a
+        write-triggered forced fetch (e.g. valve.py after open/close) must
+        not clear a genuinely active pause just because that response
+        doesn't mention it."""
+        entry = _make_entry(hass)
+        coordinator = LKSystemCoordinator(hass, entry)
+
+        with _patch_manager(fake_manager):
+            data = await coordinator._async_update_data()
+        coordinator.async_set_updated_data(data)
+        coordinator.set_leak_detection_paused_until(CUBIC_IDENTITY, 900)
+
+        fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
+            build_live_config_without_mute_leak()
+        )
+
+        with _patch_manager(fake_manager):
+            await coordinator.force_cubic_secure_configuration_update(CUBIC_IDENTITY)
+
+        assert CUBIC_IDENTITY in coordinator.leak_detection_paused_until
+        await coordinator.async_shutdown()  # cancel the scheduled expiry check
+
+
+async def _paused_coordinator(hass, fake_manager, seconds=60):
+    """Build a coordinator with an already-completed initial refresh and
+    an active local pause, for the retry-loop tests below - they all start
+    from this same state and only differ in what happens next."""
+    entry = _make_entry(hass)
+    coordinator = LKSystemCoordinator(hass, entry)
+    with _patch_manager(fake_manager):
+        data = await coordinator._async_update_data()
+    coordinator.async_set_updated_data(data)
+
+    coordinator.set_leak_detection_paused_until(CUBIC_IDENTITY, seconds)
+    target = coordinator.leak_detection_paused_until[CUBIC_IDENTITY]
+    return coordinator, target
+
+
+class TestLeakDetectionExpiryRefresh:
+    """A pause's target end time passing doesn't itself cause anything to
+    happen - nothing watches the clock for it, so without this, "Leak
+    Detection Paused Until" would just sit there showing a stale value
+    until the next regular poll (up to a full update_interval later).
+    These poll the cloud starting at the target, retrying at
+    LEAK_DETECTION_EXPIRY_RETRY_INTERVAL_SECONDS until it confirms the
+    pause is actually over - see that constant's docstring for why a
+    single delayed check isn't used instead.
+    """
+
+    async def test_resolves_on_the_first_check_if_already_over(
+        self, hass, fake_manager
+    ):
+        coordinator, target = await _paused_coordinator(hass, fake_manager)
+        fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
+            build_cubic_configuration(mute_leak=0)
+        )
+
+        with _patch_manager(fake_manager):
+            async_fire_time_changed(hass, target)
+            await hass.async_block_till_done()
+
+        assert CUBIC_IDENTITY not in coordinator.leak_detection_paused_until
+
+    async def test_notifies_listeners_after_resolving_not_before(
+        self, hass, fake_manager
+    ):
+        """A coordinator listener (standing in for the Resume button and
+        the "Leak Detection Paused Until" sensor, both of which re-render
+        off a listener notification) must see the pause actually cleared
+        by the time it's called - not be notified while
+        leak_detection_paused_until is still stale, with nothing telling
+        it to re-render again once the clear happens a moment later."""
+        coordinator, target = await _paused_coordinator(hass, fake_manager)
+        fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
+            build_cubic_configuration(mute_leak=0)
+        )
+
+        paused_at_last_notify = []
+        coordinator.async_add_listener(
+            lambda: paused_at_last_notify.append(
+                CUBIC_IDENTITY in coordinator.leak_detection_paused_until
+            )
+        )
+
+        with _patch_manager(fake_manager):
+            async_fire_time_changed(hass, target)
+            await hass.async_block_till_done()
+
+        assert CUBIC_IDENTITY not in coordinator.leak_detection_paused_until
+        assert paused_at_last_notify[-1] is False
+        await coordinator.async_shutdown()  # cancel the now-listened-for refresh interval
+
+    async def test_does_not_check_before_the_target(self, hass, fake_manager):
+        coordinator, target = await _paused_coordinator(hass, fake_manager)
+        fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
+            build_cubic_configuration(mute_leak=0)
+        )
+
+        with _patch_manager(fake_manager):
+            async_fire_time_changed(hass, target - timedelta(seconds=5))
+            await hass.async_block_till_done()
+
+        assert CUBIC_IDENTITY in coordinator.leak_detection_paused_until
+        await coordinator.async_shutdown()  # cancel the still-pending check
+
+    async def test_retries_until_the_cloud_confirms_it_is_over(
+        self, hass, fake_manager
+    ):
+        """The cloud can still report a pause as active right at its
+        target end time (confirmed empirically against the real API) -
+        the first check seeing that must not be treated as final."""
+        coordinator, target = await _paused_coordinator(hass, fake_manager)
+        fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
+            build_cubic_configuration(mute_leak=60)
+        )
+
+        with _patch_manager(fake_manager):
+            async_fire_time_changed(hass, target)
+            await hass.async_block_till_done()
+
+        assert CUBIC_IDENTITY in coordinator.leak_detection_paused_until
+
+        fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
+            build_cubic_configuration(mute_leak=0)
+        )
+
+        with _patch_manager(fake_manager):
+            async_fire_time_changed(
+                hass,
+                target
+                + timedelta(seconds=LEAK_DETECTION_EXPIRY_RETRY_INTERVAL_SECONDS),
+            )
+            await hass.async_block_till_done()
+
+        assert CUBIC_IDENTITY not in coordinator.leak_detection_paused_until
+
+    async def test_gives_up_after_the_max_retry_window(self, hass, fake_manager):
+        """A safety cap for if the cloud never resolves (e.g. the device
+        has gone offline) - falls back to the regular poll rather than
+        retrying forever."""
+        coordinator, target = await _paused_coordinator(hass, fake_manager)
+        fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
+            build_cubic_configuration(mute_leak=60)
+        )
+
+        # async_fire_time_changed only fires whatever's already scheduled
+        # at the moment it's called - a follow-up retry scheduled
+        # reactively during that firing needs its own separate jump to
+        # fire in turn, so step through the retries one interval at a
+        # time rather than jumping straight to a point past all of them.
+        steps = LEAK_DETECTION_EXPIRY_MAX_RETRY_SECONDS // LEAK_DETECTION_EXPIRY_RETRY_INTERVAL_SECONDS + 2
+        with _patch_manager(fake_manager):
+            for step in range(1, steps + 1):
+                async_fire_time_changed(
+                    hass,
+                    target
+                    + timedelta(
+                        seconds=step * LEAK_DETECTION_EXPIRY_RETRY_INTERVAL_SECONDS
+                    ),
+                )
+                await hass.async_block_till_done()
+
+        # Never confirmed resolved - still tracked under its original
+        # target - but no retry left pending (the test's own teardown
+        # would fail on a lingering timer if one were).
+        assert CUBIC_IDENTITY in coordinator.leak_detection_paused_until
+
+    async def test_resuming_cancels_the_pending_retries(self, hass, fake_manager):
+        coordinator, target = await _paused_coordinator(hass, fake_manager)
+        coordinator.set_leak_detection_paused_until(CUBIC_IDENTITY, 0)
+        calls_before = len(fake_manager.calls)
+
+        with _patch_manager(fake_manager):
+            async_fire_time_changed(
+                hass, target + timedelta(seconds=LEAK_DETECTION_EXPIRY_MAX_RETRY_SECONDS)
+            )
+            await hass.async_block_till_done()
+
+        assert len(fake_manager.calls) == calls_before
+
+    async def test_re_pausing_replaces_the_pending_retries(self, hass, fake_manager):
+        """Re-pausing while already active resets the target (confirmed
+        empirically against the real API) - the scheduled retries must
+        move with it rather than firing early against the old target."""
+        coordinator, original_target = await _paused_coordinator(hass, fake_manager)
+        coordinator.set_leak_detection_paused_until(CUBIC_IDENTITY, 600)
+        fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
+            build_cubic_configuration(mute_leak=0)
+        )
+
+        with _patch_manager(fake_manager):
+            async_fire_time_changed(hass, original_target)
+            await hass.async_block_till_done()
+
+        # The old target's check must not have fired - the pause is still
+        # tracked, under its new (later) target.
+        assert CUBIC_IDENTITY in coordinator.leak_detection_paused_until
+        assert coordinator.leak_detection_paused_until[CUBIC_IDENTITY] != original_target
+        await coordinator.async_shutdown()  # cancel the still-pending new check
+
+    async def test_shutdown_cancels_pending_retries(self, hass, fake_manager):
+        """Otherwise a retry scheduled before unload would fire against a
+        torn-down coordinator afterwards - including one scheduled by a
+        previous retry iteration, not just the first check."""
+        coordinator, target = await _paused_coordinator(hass, fake_manager)
+        fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
+            build_cubic_configuration(mute_leak=60)
+        )
+
+        with _patch_manager(fake_manager):
+            async_fire_time_changed(hass, target)  # still active - schedules a retry
+            await hass.async_block_till_done()
+        calls_before = len(fake_manager.calls)
+
+        await coordinator.async_shutdown()
+
+        with _patch_manager(fake_manager):
+            async_fire_time_changed(
+                hass,
+                target
+                + timedelta(seconds=LEAK_DETECTION_EXPIRY_MAX_RETRY_SECONDS + 30),
+            )
+            await hass.async_block_till_done()
+
+        assert len(fake_manager.calls) == calls_before
 
 
 class TestSetThermostatTemperature:

@@ -18,14 +18,15 @@ from homeassistant.helpers import device_registry as dr
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.lksystems.const import DOMAIN
+from custom_components.lksystems.services import pause_leak_detection_for_serial
 
-from .conftest import CUBIC_IDENTITY
-
-
-def _patch_services_manager(manager):
-    return patch(
-        "custom_components.lksystems.services.LKSystemsManager", return_value=manager
-    )
+from .conftest import (
+    CUBIC_IDENTITY,
+    build_cubic_configuration,
+    entity_id,
+    patch_all_managers,
+    patch_services_manager,
+)
 
 
 async def _setup_entry_and_get_cubic_device(hass, manager):
@@ -49,7 +50,7 @@ async def _setup_entry_and_get_cubic_device(hass, manager):
 async def test_close_valve_calls_client(hass, fake_manager):
     _, device_entry = await _setup_entry_and_get_cubic_device(hass, fake_manager)
 
-    with _patch_services_manager(fake_manager):
+    with patch_services_manager(fake_manager):
         await hass.services.async_call(
             DOMAIN, "close_valve", {"device_id": device_entry.id}, blocking=True
         )
@@ -60,7 +61,7 @@ async def test_close_valve_calls_client(hass, fake_manager):
 async def test_open_valve_calls_client(hass, fake_manager):
     _, device_entry = await _setup_entry_and_get_cubic_device(hass, fake_manager)
 
-    with _patch_services_manager(fake_manager):
+    with patch_services_manager(fake_manager):
         await hass.services.async_call(
             DOMAIN, "open_valve", {"device_id": device_entry.id}, blocking=True
         )
@@ -71,7 +72,7 @@ async def test_open_valve_calls_client(hass, fake_manager):
 async def test_pause_leak_detection_calls_client(hass, fake_manager):
     _, device_entry = await _setup_entry_and_get_cubic_device(hass, fake_manager)
 
-    with _patch_services_manager(fake_manager):
+    with patch_services_manager(fake_manager):
         await hass.services.async_call(
             DOMAIN,
             "pause_leak_detection",
@@ -86,10 +87,97 @@ async def test_pause_leak_detection_calls_client(hass, fake_manager):
     ) in fake_manager.calls
 
 
+async def test_pause_leak_detection_logs_its_own_action(hass, fake_manager, caplog):
+    """Regression test: the handler used to log "Closing valve %s",
+    copy-pasted from close_valve and never updated."""
+    _, device_entry = await _setup_entry_and_get_cubic_device(hass, fake_manager)
+
+    with patch_services_manager(fake_manager), caplog.at_level("INFO"):
+        await hass.services.async_call(
+            DOMAIN,
+            "pause_leak_detection",
+            {"device_id": device_entry.id, "seconds": 1800},
+            blocking=True,
+        )
+
+    assert "closing valve" not in caplog.text.lower()
+    assert "pausing leak detection" in caplog.text.lower()
+
+
+class TestPauseLeakDetectionForSerial:
+    """Direct tests for pause_leak_detection_for_serial (see its own
+    docstring for why it's called directly rather than only through the
+    service)."""
+
+    async def test_calls_the_client(self, hass, fake_manager):
+        entry, _ = await _setup_entry_and_get_cubic_device(hass, fake_manager)
+
+        with patch_all_managers(fake_manager):
+            await pause_leak_detection_for_serial(hass, entry, CUBIC_IDENTITY, 1800)
+
+        assert (
+            "cubic_secure_pause_leak_detection",
+            CUBIC_IDENTITY,
+            1800,
+        ) in fake_manager.calls
+
+    async def test_login_failure_does_not_raise(self, hass, fake_manager):
+        entry, _ = await _setup_entry_and_get_cubic_device(hass, fake_manager)
+        fake_manager.login_result = False
+
+        with patch_all_managers(fake_manager):
+            await pause_leak_detection_for_serial(hass, entry, CUBIC_IDENTITY, 1800)
+
+        assert not any(c[0] == "cubic_secure_pause_leak_detection" for c in fake_manager.calls)
+
+    async def test_refreshes_the_paused_until_sensor(self, hass, fake_manager):
+        """Regression test: the refresh used to live only in button.py,
+        so calling this function any other way (e.g. the raw HA service)
+        never updated the "Leak Detection Paused Until" sensor."""
+        entry, _ = await _setup_entry_and_get_cubic_device(hass, fake_manager)
+        paused_until_entity_id = entity_id(
+            hass, "sensor", f"LkUid_leakDetectionPausedUntil_{CUBIC_IDENTITY}"
+        )
+        fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
+            build_cubic_configuration(mute_leak=1800)
+        )
+
+        with patch_all_managers(fake_manager):
+            await pause_leak_detection_for_serial(hass, entry, CUBIC_IDENTITY, 1800)
+
+        assert hass.states.get(paused_until_entity_id).state != "unknown"
+
+    async def test_sets_the_local_paused_until_target_immediately(
+        self, hass, fake_manager
+    ):
+        """Doesn't wait on the cloud to confirm the pause - muteLeak is
+        static and can lag by up to a poll interval, so the coordinator's
+        own target is set right away rather than left to reconciliation."""
+        entry, _ = await _setup_entry_and_get_cubic_device(hass, fake_manager)
+        coordinator = hass.data[DOMAIN][entry.entry_id]
+
+        with patch_all_managers(fake_manager):
+            await pause_leak_detection_for_serial(hass, entry, CUBIC_IDENTITY, 1800)
+
+        assert CUBIC_IDENTITY in coordinator.leak_detection_paused_until
+
+    async def test_zero_seconds_clears_the_local_paused_until_target(
+        self, hass, fake_manager
+    ):
+        entry, _ = await _setup_entry_and_get_cubic_device(hass, fake_manager)
+        coordinator = hass.data[DOMAIN][entry.entry_id]
+        coordinator.set_leak_detection_paused_until(CUBIC_IDENTITY, 1800)
+
+        with patch_all_managers(fake_manager):
+            await pause_leak_detection_for_serial(hass, entry, CUBIC_IDENTITY, 0)
+
+        assert CUBIC_IDENTITY not in coordinator.leak_detection_paused_until
+
+
 async def test_set_pressure_test_schedule_calls_client(hass, fake_manager):
     _, device_entry = await _setup_entry_and_get_cubic_device(hass, fake_manager)
 
-    with _patch_services_manager(fake_manager):
+    with patch_services_manager(fake_manager):
         await hass.services.async_call(
             DOMAIN,
             "set_pressure_test_schedule",
@@ -108,7 +196,7 @@ async def test_set_pressure_test_schedule_calls_client(hass, fake_manager):
 async def test_set_thresholds_calls_client_with_defaults(hass, fake_manager):
     _, device_entry = await _setup_entry_and_get_cubic_device(hass, fake_manager)
 
-    with _patch_services_manager(fake_manager):
+    with patch_services_manager(fake_manager):
         await hass.services.async_call(
             DOMAIN,
             "set_thresholds",
@@ -131,7 +219,7 @@ async def test_close_valve_login_failure_does_not_raise(hass, fake_manager):
     _, device_entry = await _setup_entry_and_get_cubic_device(hass, fake_manager)
     fake_manager.login_result = False
 
-    with _patch_services_manager(fake_manager):
+    with patch_services_manager(fake_manager):
         await hass.services.async_call(
             DOMAIN, "close_valve", {"device_id": device_entry.id}, blocking=True
         )
@@ -163,7 +251,7 @@ async def test_unknown_device_does_not_raise(
     """
     await _setup_entry_and_get_cubic_device(hass, fake_manager)
 
-    with _patch_services_manager(fake_manager):
+    with patch_services_manager(fake_manager):
         await hass.services.async_call(
             DOMAIN,
             service,

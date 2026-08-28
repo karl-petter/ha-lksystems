@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 from homeassistant.components.sensor import (
@@ -28,17 +29,15 @@ from homeassistant.helpers.update_coordinator import (
 )
 import homeassistant.util.dt as dt_util
 
-from . import LKSystemCoordinator
+from . import LKSystemCoordinator, cubic_secure_device_info
 from .const import (
     ATTRIBUTION,
     C_NEXT_UPDATE_TIME,
     C_UPDATE_TIME,
-    CUBIC_SECURE_MODEL,
     DOMAIN,
     INTEGRATION_NAME,
     LK_CUBICSECURE_SENSORS,
     LK_CUBICSECURE_CONFIG_SENSORS,
-    MANUFACTURER,
 )
 from .restore import RestoredNativeValueMixin, last_successful_cloud_fetch_attributes
 
@@ -175,6 +174,10 @@ async def async_setup_entry(
                                 data_source="configuration",
                             )
                         )
+
+                cubic_entities.append(
+                    LKLeakDetectionPausedUntilSensor(coordinator, device_identity)
+                )
 
                 async_add_entities(cubic_entities, True)
 
@@ -936,12 +939,7 @@ class AbstractLkCubicSensor(
         _LOGGER.debug("Creating %s sensor", description.name)
         super().__init__(coordinator)
         self._coordinator = coordinator
-        self._device_model = CUBIC_SECURE_MODEL
         self._id = device_identity
-        machine_info = coordinator.data["cubic_devices"][device_identity][
-            "machine_info"
-        ]
-        self._device_name = f"Cubic Secure {machine_info['zone']['zoneName']}"
         self.entity_description = description
         self.native_unit_of_measurement = description.native_unit_of_measurement
         self._attr_unique_id = f"LkUid_{description.key}_{device_identity}"
@@ -950,14 +948,14 @@ class AbstractLkCubicSensor(
     @property
     def device_info(self) -> DeviceInfo:
         """Return the device_info of the device."""
-        device_info = DeviceInfo(
-            identifiers={(DOMAIN, self._id)},
-            manufacturer=MANUFACTURER,
-            model=self._device_model,
-            name=self._device_name,
-            serial_number=self._id,
+        return cubic_secure_device_info(self.coordinator, self._id)
+
+    def _cubic_configuration(self) -> dict:
+        """Return this device's last-fetched configuration dict."""
+        device_data = self._coordinator.data.get("cubic_devices", {}).get(
+            self._id, {}
         )
-        return device_info
+        return device_data.get("configuration") or {}
 
 
 class LKCubicSensor(AbstractLkCubicSensor):
@@ -1024,7 +1022,7 @@ class LKCubicSensor(AbstractLkCubicSensor):
         )
 
         if self._data_source == "configuration":
-            cubic_configuration = device_data.get("configuration") or {}
+            cubic_configuration = self._cubic_configuration()
             if self._data_key in cubic_configuration:
                 value = cubic_configuration[self._data_key]
             elif "." in self._data_key:
@@ -1053,5 +1051,43 @@ class LKCubicSensor(AbstractLkCubicSensor):
                 return dt_util.utc_from_timestamp(float(value))
             except (ValueError, TypeError):
                 pass
-        
+
         return value
+
+
+class LKLeakDetectionPausedUntilSensor(AbstractLkCubicSensor):
+    """When the device's leak detection will resume, if currently paused.
+
+    Reads LKSystemCoordinator.leak_detection_paused_until through
+    unchanged - see that attribute's own docstring for why it's tracked
+    locally rather than computed from the API's data on every read.
+    """
+
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_icon = "mdi:timer-pause-outline"
+    _attr_translation_key = "leak_detection_paused_until_sensor"
+
+    def __init__(self, coordinator: LKSystemCoordinator, device_identity: str) -> None:
+        """Initialize the sensor."""
+        description = SensorEntityDescription(
+            key="leakDetectionPausedUntil",
+            name="Leak Detection Paused Until",
+        )
+        super().__init__(
+            coordinator=coordinator,
+            description=description,
+            device_identity=device_identity,
+        )
+
+    def _live_native_value(self) -> datetime | None:
+        """Get the latest state value from the coordinator's live data."""
+        return self.coordinator.leak_detection_paused_until.get(self._id)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Expose the last-successful-cloud-fetch timestamp, matching every
+        other cubic sensor - see restore.py for why it needs to survive
+        across a restart."""
+        return last_successful_cloud_fetch_attributes(
+            self.coordinator.last_successful_cloud_fetch
+        )

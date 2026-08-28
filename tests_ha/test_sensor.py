@@ -30,6 +30,7 @@ from custom_components.lksystems.sensor import (
     LKArcHubEntity,
     LKArcSensorEntity,
     LKCubicSensor,
+    LKLeakDetectionPausedUntilSensor,
 )
 
 from .conftest import (
@@ -37,6 +38,7 @@ from .conftest import (
     HUB_IDENTITY,
     SENSOR_MAC,
     THERMOSTAT_MAC,
+    build_cubic_configuration,
     entity_id,
     setup_entry,
 )
@@ -285,6 +287,80 @@ class TestCubicSensorRestore:
             CUBIC_IDENTITY
         ]["configuration"]["firmwareVersion"]
         assert entity.native_value != "old-version"
+
+
+class TestLeakDetectionPausedUntilSensor:
+    """See LKLeakDetectionPausedUntilSensor's own docstring for why it
+    reads the coordinator's locally tracked target rather than computing
+    one from muteLeak itself."""
+
+    async def test_none_when_not_currently_paused(self, hass, fake_manager):
+        entry = await setup_entry(hass, fake_manager)
+        coordinator = hass.data[DOMAIN][entry.entry_id]
+
+        entity = LKLeakDetectionPausedUntilSensor(coordinator, CUBIC_IDENTITY)
+
+        assert entity.native_value is None
+
+    async def test_reflects_the_coordinators_locally_tracked_target(
+        self, hass, fake_manager
+    ):
+        entry = await setup_entry(hass, fake_manager)
+        coordinator = hass.data[DOMAIN][entry.entry_id]
+        coordinator.set_leak_detection_paused_until(CUBIC_IDENTITY, 300)
+
+        entity = LKLeakDetectionPausedUntilSensor(coordinator, CUBIC_IDENTITY)
+
+        assert (
+            entity.native_value
+            == coordinator.leak_detection_paused_until[CUBIC_IDENTITY]
+        )
+
+    async def test_belongs_to_the_cubic_secure_device(self, hass, fake_manager):
+        await setup_entry(hass, fake_manager)
+        sensor_entity_id = entity_id(
+            hass, "sensor", f"LkUid_leakDetectionPausedUntil_{CUBIC_IDENTITY}"
+        )
+
+        device = dr.async_get(hass).async_get_device(
+            identifiers={(DOMAIN, CUBIC_IDENTITY)}
+        )
+        registry_entry = er.async_get(hass).async_get(sensor_entity_id)
+
+        assert registry_entry.device_id == device.id
+        assert registry_entry.disabled_by is None
+
+    async def test_extra_state_attributes_carries_last_successful_cloud_fetch(
+        self, hass, fake_manager
+    ):
+        """Every other cubic sensor exposes this attribute (see
+        AbstractLkCubicSensor's sibling classes) - restore.py reads it back
+        out of the restored state to decide whether a restored value is
+        still fresh across an HA restart, so this sensor needs it too."""
+        entry = await setup_entry(hass, fake_manager)
+        coordinator = hass.data[DOMAIN][entry.entry_id]
+
+        entity = LKLeakDetectionPausedUntilSensor(coordinator, CUBIC_IDENTITY)
+
+        assert ATTR_LAST_SUCCESSFUL_CLOUD_FETCH in entity.extra_state_attributes
+
+    async def test_restores_value_when_live_fetch_failed_and_restore_is_fresh(
+        self, hass, fake_manager
+    ):
+        entity_id_str = "sensor.test_restore_paused_until"
+        restored_value = dt_util.utcnow() + timedelta(minutes=5)
+        _seed_restore_cache(hass, entity_id_str, restored_value, dt_util.utcnow())
+
+        entry = await setup_entry(hass, fake_manager)
+        coordinator = hass.data[DOMAIN][entry.entry_id]
+        # No live muteLeak - the only value available is the restored one.
+
+        entity = LKLeakDetectionPausedUntilSensor(coordinator, CUBIC_IDENTITY)
+        entity.hass = hass
+        entity.entity_id = entity_id_str
+        await entity.async_added_to_hass()
+
+        assert entity.native_value == restored_value
 
 
 def _thermostat_device(coordinator) -> dict:
