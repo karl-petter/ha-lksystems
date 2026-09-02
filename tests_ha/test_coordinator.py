@@ -37,6 +37,8 @@ from custom_components.lksystems.const import (
     DOMAIN,
     LEAK_DETECTION_EXPIRY_MAX_RETRY_SECONDS,
     LEAK_DETECTION_EXPIRY_RETRY_INTERVAL_SECONDS,
+    LEAK_DETECTION_LOCAL_WRITE_GRACE_SECONDS,
+    PAUSE_LEAK_DETECTION_MIN_SECONDS,
 )
 from custom_components.lksystems.repairs import _issue_id
 
@@ -761,15 +763,43 @@ class TestLeakDetectionPausedUntilTracking:
         assert CUBIC_IDENTITY in coordinator.leak_detection_paused_until
         await coordinator.async_shutdown()  # cancel the scheduled expiry check
 
+    async def test_regular_poll_does_not_clear_a_pause_moments_after_it_was_set(
+        self, hass, fake_manager
+    ):
+        """A regular poll isn't triggered by a write, but nothing stops
+        its own independent timer from landing moments after one anyway.
+        The cloud's cached response can still be serving a pre-write
+        snapshot for tens of seconds after HA's own pause API call
+        succeeded (confirmed empirically against the real API) - a poll
+        that lands in that window must not let a stale muteLeak=0
+        override the pause HA itself just set."""
+        entry = _make_entry(hass)
+        coordinator = LKSystemCoordinator(hass, entry)
+        coordinator.set_leak_detection_paused_until(CUBIC_IDENTITY, 900)
+        fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
+            build_cubic_configuration(mute_leak=0)
+        )
+
+        with _patch_manager(fake_manager):
+            await coordinator._async_update_data()
+
+        assert CUBIC_IDENTITY in coordinator.leak_detection_paused_until
+        await coordinator.async_shutdown()  # cancel the scheduled expiry check
+
     async def test_regular_poll_clears_it_once_the_cloud_reports_inactive(
         self, hass, fake_manager
     ):
         """Covers both natural expiry and a cancel issued from elsewhere
         (e.g. the LK app's own "Stop" action) - either way, the cloud
-        reporting muteLeak=0 is what HA learns it from."""
+        reporting muteLeak=0 is what HA learns it from, once enough time
+        has passed since the last HA-issued write for that to be
+        trustworthy rather than a stale pre-write snapshot."""
         entry = _make_entry(hass)
         coordinator = LKSystemCoordinator(hass, entry)
         coordinator.set_leak_detection_paused_until(CUBIC_IDENTITY, 900)
+        coordinator._leak_detection_last_local_write[CUBIC_IDENTITY] -= timedelta(
+            seconds=LEAK_DETECTION_LOCAL_WRITE_GRACE_SECONDS
+        )
         fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
             build_cubic_configuration(mute_leak=0)
         )
@@ -829,10 +859,16 @@ class TestLeakDetectionPausedUntilTracking:
         await coordinator.async_shutdown()  # cancel the scheduled expiry check
 
 
-async def _paused_coordinator(hass, fake_manager, seconds=60):
+async def _paused_coordinator(hass, fake_manager, seconds=300):
     """Build a coordinator with an already-completed initial refresh and
     an active local pause, for the retry-loop tests below - they all start
-    from this same state and only differ in what happens next."""
+    from this same state and only differ in what happens next.
+
+    Deliberately well clear of both PAUSE_LEAK_DETECTION_MIN_SECONDS and
+    LEAK_DETECTION_LOCAL_WRITE_GRACE_SECONDS (currently equal, at 60s) -
+    these tests are about the retry loop's own timing, not about its
+    interaction with the write-grace window right at a minimum-duration
+    pause's target, which is covered separately."""
     entry = _make_entry(hass)
     coordinator = LKSystemCoordinator(hass, entry)
     with _patch_manager(fake_manager):
@@ -931,6 +967,43 @@ class TestLeakDetectionExpiryRefresh:
         fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
             build_cubic_configuration(mute_leak=0)
         )
+
+        with _patch_manager(fake_manager):
+            async_fire_time_changed(
+                hass,
+                target
+                + timedelta(seconds=LEAK_DETECTION_EXPIRY_RETRY_INTERVAL_SECONDS),
+            )
+            await hass.async_block_till_done()
+
+        assert CUBIC_IDENTITY not in coordinator.leak_detection_paused_until
+
+    async def test_minimum_duration_pause_self_heals_past_a_grace_window_no_op(
+        self, hass, fake_manager
+    ):
+        """PAUSE_LEAK_DETECTION_MIN_SECONDS and
+        LEAK_DETECTION_LOCAL_WRITE_GRACE_SECONDS are currently equal (60s),
+        so a minimum-duration pause's target can land inside its own
+        write-grace window - the first check that lands there is a
+        deliberate no-op (see _reconcile_leak_detection_paused_until), not
+        a resolution. It isn't left stuck there: the loop's own next retry,
+        LEAK_DETECTION_EXPIRY_RETRY_INTERVAL_SECONDS later, is always past
+        the grace window and resolves it normally."""
+        coordinator, target = await _paused_coordinator(
+            hass, fake_manager, seconds=PAUSE_LEAK_DETECTION_MIN_SECONDS
+        )
+        coordinator._leak_detection_last_local_write[CUBIC_IDENTITY] = (
+            target - timedelta(seconds=LEAK_DETECTION_LOCAL_WRITE_GRACE_SECONDS - 10)
+        )
+        fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
+            build_cubic_configuration(mute_leak=0)
+        )
+
+        with _patch_manager(fake_manager):
+            async_fire_time_changed(hass, target)
+            await hass.async_block_till_done()
+
+        assert CUBIC_IDENTITY in coordinator.leak_detection_paused_until
 
         with _patch_manager(fake_manager):
             async_fire_time_changed(

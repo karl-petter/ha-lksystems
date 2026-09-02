@@ -49,6 +49,15 @@ LEAK_DETECTION_EXPIRY_RETRY_INTERVAL_SECONDS: Final = 15
 # has gone offline), not a value normal operation is expected to reach.
 LEAK_DETECTION_EXPIRY_MAX_RETRY_SECONDS: Final = 180
 
+# For this long after HA itself issues a pause/resume, don't let a
+# reconciliation pass override the local state with what the cloud
+# reports - the cloud's cached response can still be serving a pre-write
+# snapshot for tens of seconds (confirmed empirically against the real
+# API), and a poll landing in that window isn't caused by the write but
+# can still land inside it by coincidence. HA's own just-made write is
+# trusted for this window; past it, the cloud is trusted again.
+LEAK_DETECTION_LOCAL_WRITE_GRACE_SECONDS: Final = 60
+
 
 LK_CUBICSECURE_SENSORS: dict[str, SensorEntityDescription] = {
     "volumetotalday": SensorEntityDescription(

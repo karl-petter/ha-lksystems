@@ -40,6 +40,7 @@ from .const import (
     DOMAIN,
     LEAK_DETECTION_EXPIRY_MAX_RETRY_SECONDS,
     LEAK_DETECTION_EXPIRY_RETRY_INTERVAL_SECONDS,
+    LEAK_DETECTION_LOCAL_WRITE_GRACE_SECONDS,
     MANUFACTURER,
 )
 from .pylksystems import (
@@ -274,6 +275,13 @@ class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
         # _reconcile_leak_detection_paused_until() on every cached
         # configuration fetch.
         self.leak_detection_paused_until: dict[str, datetime] = {}
+
+        # When set_leak_detection_paused_until() last landed for a
+        # device - guards _reconcile_leak_detection_paused_until() against
+        # a poll that coincidentally lands moments after that write, while
+        # the cloud's cached response may still be serving a pre-write
+        # snapshot (see LEAK_DETECTION_LOCAL_WRITE_GRACE_SECONDS).
+        self._leak_detection_last_local_write: dict[str, datetime] = {}
 
         # Cancel handle for each device's pending
         # _schedule_leak_detection_expiry_refresh() call, if any - reaching
@@ -517,13 +525,14 @@ class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
         previous target rather than leaving it in place, matching the real
         API's reset-not-stack behavior (confirmed empirically).
         """
+        self._leak_detection_last_local_write[device_identity] = dt_util.utcnow()
         if not seconds:
             self._clear_leak_detection_paused_until(device_identity)
             return
         self._adopt_leak_detection_target(device_identity, seconds)
 
     def _reconcile_leak_detection_paused_until(
-        self, device_identity: str, configuration: dict
+        self, device_identity: str, configuration: dict, now: datetime
     ) -> None:
         """Keep the locally tracked pause end time in sync with a pause
         HA didn't itself just set - one started or cancelled from
@@ -535,7 +544,24 @@ class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
         a brand new one started for a different duration - only
         set_leak_detection_paused_until() (an explicit request HA itself
         just made) may do that.
+
+        Also does nothing within LEAK_DETECTION_LOCAL_WRITE_GRACE_SECONDS
+        of such a write: the caller triggering this (a regular poll or
+        the expiry retry-loop) isn't caused by the write, but nothing
+        stops it landing moments after one anyway, and `configuration`
+        can still be a pre-write cached snapshot at that point. Takes
+        `now` from the caller rather than reading dt_util.utcnow() itself,
+        so it judges the grace window against whatever moment the caller
+        is actually acting on - the expiry retry-loop already has its own
+        `now` (the point in time HA's scheduler woke it for), and reusing
+        it here keeps this check consistent with that, rather than a
+        second, independent clock read a moment later.
         """
+        last_write = self._leak_detection_last_local_write.get(device_identity)
+        if last_write is not None and now - last_write < timedelta(
+            seconds=LEAK_DETECTION_LOCAL_WRITE_GRACE_SECONDS
+        ):
+            return
         mute_leak_seconds = configuration.get("muteLeak")
         if not mute_leak_seconds:
             self._clear_leak_detection_paused_until(device_identity)
@@ -570,7 +596,9 @@ class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
             configuration = self.data["cubic_devices"][device_identity][
                 "configuration"
             ]
-            self._reconcile_leak_detection_paused_until(device_identity, configuration)
+            self._reconcile_leak_detection_paused_until(
+                device_identity, configuration, now
+            )
             # refresh_cubic_secure_configuration() above already notified
             # listeners once, before this reconcile ran - entities reading
             # leak_detection_paused_until (the Resume button, the "Leak
@@ -1006,7 +1034,9 @@ class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
                                     "configuration"
                                 ] = lk_inst.cubic_secure_configuration
                                 self._reconcile_leak_detection_paused_until(
-                                    device_identity, lk_inst.cubic_secure_configuration
+                                    device_identity,
+                                    lk_inst.cubic_secure_configuration,
+                                    dt_util.utcnow(),
                                 )
                             except Exception as err:
                                 # Sensors index these keys directly, so they
