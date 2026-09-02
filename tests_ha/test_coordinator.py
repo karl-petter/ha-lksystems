@@ -978,6 +978,31 @@ class TestLeakDetectionExpiryRefresh:
 
         assert CUBIC_IDENTITY not in coordinator.leak_detection_paused_until
 
+    async def test_a_still_active_retry_check_never_touches_the_tracked_target(
+        self, hass, fake_manager
+    ):
+        """Unlike a poll landing right after a write (which risks clobbering
+        a fresher local value with a staler cloud one - see
+        LEAK_DETECTION_LOCAL_WRITE_GRACE_SECONDS), a retry check reading
+        stale "still active" data has nothing to clobber: the device is
+        already tracked for its own pause the whole time this loop runs,
+        so _reconcile_leak_detection_paused_until()'s own
+        never-overwrite-an-already-tracked-target rule applies regardless
+        of what muteLeak says, not just when it happens to match. Proves
+        that by using a muteLeak value a naive re-adopt would compute a
+        different target from, and asserting the original is untouched."""
+        coordinator, target = await _paused_coordinator(hass, fake_manager)
+        fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
+            build_cubic_configuration(mute_leak=9999)
+        )
+
+        with _patch_manager(fake_manager):
+            async_fire_time_changed(hass, target)
+            await hass.async_block_till_done()
+
+        assert coordinator.leak_detection_paused_until[CUBIC_IDENTITY] == target
+        await coordinator.async_shutdown()  # cancel the still-pending retry
+
     async def test_minimum_duration_pause_self_heals_past_a_grace_window_no_op(
         self, hass, fake_manager
     ):
