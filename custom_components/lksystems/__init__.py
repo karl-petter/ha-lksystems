@@ -700,17 +700,22 @@ class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
             # state until the next regular poll.
             self.async_update_listeners()
 
-        async def _check_valve_state(now: datetime) -> None:
+        async def _check_valve_state(_scheduled_for: datetime) -> None:
             self._valve_action_unsub.pop(device_identity, None)
-            fetch_started_at = dt_util.utcnow()
             if not await self.force_cubic_secure_configuration_update(device_identity):
                 return
-            # LK's API rate-limits this specific endpoint (confirmed
-            # empirically) and pylksystems honors its Retry-After, so a
-            # single attempt can genuinely take tens of seconds - measured
-            # here so the next check (below) doesn't fire on schedule
-            # right into the same rate limit that just delayed this one.
-            fetch_duration = dt_util.utcnow() - fetch_started_at
+            # dt_util.utcnow(), not _scheduled_for: the fetch above can
+            # itself take a while - LK's API rate-limits this specific
+            # endpoint (confirmed empirically, up to a 93s Retry-After
+            # observed on a real attempt) and pylksystems correctly
+            # honors it, so a single attempt can single-handedly outlast
+            # the entire retry window. Judging the deadline, or scheduling
+            # the next check, off the stale pre-fetch time would miss
+            # that entirely - the loop would keep going well past
+            # VALVE_ACTION_MAX_RETRY_SECONDS of real elapsed time, and the
+            # next check could fire straight into the same rate limit
+            # that just delayed this one.
+            now = dt_util.utcnow()
 
             valve_state = self.data["cubic_devices"][device_identity][
                 "configuration"
@@ -749,10 +754,7 @@ class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
                 )
                 return
 
-            next_delay = max(
-                timedelta(seconds=VALVE_ACTION_RETRY_INTERVAL_SECONDS), fetch_duration
-            )
-            _track_at(now + next_delay)
+            _track_at(now + timedelta(seconds=VALVE_ACTION_RETRY_INTERVAL_SECONDS))
 
         _track_at(dt_util.utcnow() + timedelta(seconds=VALVE_ACTION_RETRY_INTERVAL_SECONDS))
 

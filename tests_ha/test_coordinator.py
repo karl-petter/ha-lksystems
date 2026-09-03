@@ -8,6 +8,7 @@ whatever the client returns, token caching, and error handling.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -54,6 +55,7 @@ from .conftest import (
     build_cubic_configuration,
     build_live_config_without_mute_leak,
     get_issue,
+    tiny_valve_retry_timings,
 )
 
 
@@ -732,19 +734,10 @@ class TestValveStateConfirmation:
             build_cubic_configuration(valve_state="open")
         )
 
-        coordinator._schedule_valve_state_confirmation(CUBIC_IDENTITY, True)
-        steps = (
-            VALVE_ACTION_MAX_RETRY_SECONDS // VALVE_ACTION_RETRY_INTERVAL_SECONDS + 2
-        )
-        start = dt_util.utcnow()
-        with _patch_manager(fake_manager):
-            for step in range(1, steps + 1):
-                async_fire_time_changed(
-                    hass,
-                    start
-                    + timedelta(seconds=step * VALVE_ACTION_RETRY_INTERVAL_SECONDS),
-                )
-                await hass.async_block_till_done()
+        max_retry, retry_interval = tiny_valve_retry_timings()
+        with max_retry, retry_interval, _patch_manager(fake_manager):
+            coordinator._schedule_valve_state_confirmation(CUBIC_IDENTITY, True)
+            await asyncio.sleep(0.3)  # comfortably past the (patched) tiny window
 
         # Never confirmed by the cloud - shows the requested state anyway
         # - but no retry left pending (the test's own teardown would fail
@@ -817,21 +810,49 @@ class TestValveStateConfirmation:
             build_cubic_configuration(valve_state="open")
         )
 
-        coordinator._schedule_valve_state_confirmation(CUBIC_IDENTITY, True)
-        steps = (
-            VALVE_ACTION_MAX_RETRY_SECONDS // VALVE_ACTION_RETRY_INTERVAL_SECONDS + 2
-        )
-        start = dt_util.utcnow()
-        with _patch_manager(fake_manager):
-            for step in range(1, steps + 1):
-                async_fire_time_changed(
-                    hass,
-                    start
-                    + timedelta(seconds=step * VALVE_ACTION_RETRY_INTERVAL_SECONDS),
-                )
-                await hass.async_block_till_done()
+        max_retry, retry_interval = tiny_valve_retry_timings()
+        with max_retry, retry_interval, _patch_manager(fake_manager):
+            coordinator._schedule_valve_state_confirmation(CUBIC_IDENTITY, True)
+            await asyncio.sleep(0.3)  # comfortably past the (patched) tiny window
 
         assert CUBIC_IDENTITY not in coordinator.valve_action_pending
+
+    async def test_a_single_slow_check_gives_up_without_retrying_again(
+        self, hass, fake_manager
+    ):
+        """Regression test for a real bug found live: LK's API can
+        rate-limit this specific endpoint with a Retry-After long enough
+        that pylksystems' own (correct) wait for it can alone exceed the
+        whole retry window (a 93s Retry-After was observed on one real
+        attempt). The give-up decision has to catch that on its own -
+        comparing against a timestamp captured before the slow fetch
+        under-counts the elapsed time and would schedule yet another
+        retry into the same rate limit that just delayed this one."""
+        coordinator = await _valve_action_coordinator(hass, fake_manager)
+        fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
+            build_cubic_configuration(valve_state="open")
+        )
+        # Longer than the patched max retry window below - simulates a
+        # single fetch whose own Retry-After wait alone blows the budget.
+        fake_manager.get_cubic_secure_configuration_delay = 0.1
+
+        max_retry, retry_interval = tiny_valve_retry_timings()
+        with max_retry, retry_interval, _patch_manager(fake_manager):
+            coordinator._schedule_valve_state_confirmation(CUBIC_IDENTITY, True)
+            await asyncio.sleep(0.3)
+
+        assert (
+            fake_manager.calls.count(
+                ("get_cubic_secure_configuration", CUBIC_IDENTITY, True)
+            )
+            == 1
+        ), "should give up after the one slow attempt, not retry again"
+        assert (
+            coordinator.data["cubic_devices"][CUBIC_IDENTITY]["configuration"][
+                "valveState"
+            ]
+            == "closed"
+        )
 
 
 class TestRefreshCubicSecureConfiguration:

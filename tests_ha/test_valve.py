@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 
 import pytest
@@ -13,11 +14,7 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import async_fire_time_changed
 
-from custom_components.lksystems.const import (
-    DOMAIN,
-    VALVE_ACTION_MAX_RETRY_SECONDS,
-    VALVE_ACTION_RETRY_INTERVAL_SECONDS,
-)
+from custom_components.lksystems.const import DOMAIN, VALVE_ACTION_RETRY_INTERVAL_SECONDS
 
 from .conftest import (
     CUBIC_IDENTITY,
@@ -26,6 +23,7 @@ from .conftest import (
     entity_id,
     patch_all_managers,
     setup_entry,
+    tiny_valve_retry_timings,
 )
 
 
@@ -185,16 +183,11 @@ async def test_assumes_success_if_never_confirmed_within_the_max_retry_window(
         build_cubic_configuration(valve_state="open")
     )
 
-    steps = VALVE_ACTION_MAX_RETRY_SECONDS // VALVE_ACTION_RETRY_INTERVAL_SECONDS + 2
-    start = dt_util.utcnow()
-    with patch_all_managers(fake_manager):
+    max_retry, retry_interval = tiny_valve_retry_timings()
+    with max_retry, retry_interval, patch_all_managers(fake_manager):
         await hass.services.async_call(
             "valve", "close_valve", {"entity_id": valve_entity_id}, blocking=True
         )
-        for step in range(1, steps + 1):
-            async_fire_time_changed(
-                hass, start + timedelta(seconds=step * VALVE_ACTION_RETRY_INTERVAL_SECONDS)
-            )
-            await hass.async_block_till_done()
+        await asyncio.sleep(0.3)  # comfortably past the (patched) tiny window
 
     assert hass.states.get(valve_entity_id).state == "closed"
