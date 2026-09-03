@@ -755,6 +755,83 @@ class TestValveStateConfirmation:
             == "open"
         )
 
+    async def test_marks_the_device_pending_as_soon_as_scheduled(
+        self, hass, fake_manager
+    ):
+        """valve.py's is_closing/is_opening read this immediately, before
+        the first retry check even runs - otherwise the entity would show
+        the (possibly stale) prior state for the first
+        VALVE_ACTION_RETRY_INTERVAL_SECONDS, not "closing"/"opening"."""
+        coordinator = await _valve_action_coordinator(hass, fake_manager)
+
+        coordinator._schedule_valve_state_confirmation(CUBIC_IDENTITY, True)
+
+        assert coordinator.valve_action_pending[CUBIC_IDENTITY] is True
+        await coordinator.async_shutdown()  # cancel the still-pending check
+
+    async def test_stays_pending_through_a_non_matching_intermediate_check(
+        self, hass, fake_manager
+    ):
+        """A retry that reads a not-yet-updated value still publishes it
+        (force_cubic_secure_configuration_update() always does) - pending
+        must stay set through that, or the entity would flash to the
+        stale value instead of continuing to show "closing"/"opening"."""
+        coordinator = await _valve_action_coordinator(hass, fake_manager)
+        fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
+            build_cubic_configuration(valve_state="open")
+        )
+
+        coordinator._schedule_valve_state_confirmation(CUBIC_IDENTITY, True)
+        with _patch_manager(fake_manager):
+            async_fire_time_changed(
+                hass,
+                dt_util.utcnow()
+                + timedelta(seconds=VALVE_ACTION_RETRY_INTERVAL_SECONDS),
+            )
+            await hass.async_block_till_done()
+
+        assert coordinator.valve_action_pending[CUBIC_IDENTITY] is True
+        await coordinator.async_shutdown()  # cancel the still-pending check
+
+    async def test_clears_pending_once_confirmed(self, hass, fake_manager):
+        coordinator = await _valve_action_coordinator(hass, fake_manager)
+        fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
+            build_cubic_configuration(valve_state="closed")
+        )
+
+        coordinator._schedule_valve_state_confirmation(CUBIC_IDENTITY, True)
+        with _patch_manager(fake_manager):
+            async_fire_time_changed(
+                hass,
+                dt_util.utcnow()
+                + timedelta(seconds=VALVE_ACTION_RETRY_INTERVAL_SECONDS),
+            )
+            await hass.async_block_till_done()
+
+        assert CUBIC_IDENTITY not in coordinator.valve_action_pending
+
+    async def test_clears_pending_after_giving_up(self, hass, fake_manager):
+        coordinator = await _valve_action_coordinator(hass, fake_manager)
+        fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
+            build_cubic_configuration(valve_state="open")
+        )
+
+        coordinator._schedule_valve_state_confirmation(CUBIC_IDENTITY, True)
+        steps = (
+            VALVE_ACTION_MAX_RETRY_SECONDS // VALVE_ACTION_RETRY_INTERVAL_SECONDS + 2
+        )
+        start = dt_util.utcnow()
+        with _patch_manager(fake_manager):
+            for step in range(1, steps + 1):
+                async_fire_time_changed(
+                    hass,
+                    start
+                    + timedelta(seconds=step * VALVE_ACTION_RETRY_INTERVAL_SECONDS),
+                )
+                await hass.async_block_till_done()
+
+        assert CUBIC_IDENTITY not in coordinator.valve_action_pending
+
 
 class TestRefreshCubicSecureConfiguration:
     """See refresh_cubic_secure_configuration()'s own docstring for why

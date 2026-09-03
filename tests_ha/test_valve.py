@@ -101,6 +101,59 @@ async def test_action_calls_the_client_and_refreshes(
     assert hass.states.get(valve_entity_id).state == resulting_state
 
 
+@pytest.mark.parametrize(
+    ("ha_service", "starting_state", "transitional_state", "resulting_state"),
+    [
+        ("close_valve", "open", "closing", "closed"),
+        ("open_valve", "closed", "opening", "open"),
+    ],
+)
+async def test_shows_a_transitional_state_until_the_motor_finishes_moving(
+    hass, fake_manager, ha_service, starting_state, transitional_state, resulting_state
+):
+    """The physical motor takes real time to move - the entity must show
+    a steady "closing"/"opening" throughout, not flash through whatever
+    stale intermediate reads the confirmation retries publish along the
+    way (see LKSystemCoordinator.valve_action_pending)."""
+    fake_manager.cubic_configuration_data = build_cubic_configuration(
+        valve_state=starting_state
+    )
+    await setup_entry(hass, fake_manager)
+    valve_entity_id = entity_id(hass, "valve", _valve_unique_id(CUBIC_IDENTITY))
+    # Still mid-travel on the first retry check.
+    fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
+        build_cubic_configuration(valve_state=starting_state)
+    )
+
+    with patch_all_managers(fake_manager):
+        await hass.services.async_call(
+            "valve", ha_service, {"entity_id": valve_entity_id}, blocking=True
+        )
+
+        assert hass.states.get(valve_entity_id).state == transitional_state
+
+        async_fire_time_changed(
+            hass, dt_util.utcnow() + timedelta(seconds=VALVE_ACTION_RETRY_INTERVAL_SECONDS)
+        )
+        await hass.async_block_till_done()
+
+        assert (
+            hass.states.get(valve_entity_id).state == transitional_state
+        ), "still mid-travel - must not flash to the stale pre-action reading"
+
+        # The motor has now finished moving.
+        fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
+            build_cubic_configuration(valve_state=resulting_state)
+        )
+        async_fire_time_changed(
+            hass,
+            dt_util.utcnow() + timedelta(seconds=2 * VALVE_ACTION_RETRY_INTERVAL_SECONDS),
+        )
+        await hass.async_block_till_done()
+
+    assert hass.states.get(valve_entity_id).state == resulting_state
+
+
 async def test_two_cubic_secure_devices_get_independent_valves(
     hass, fake_manager_with_two_cubic_devices
 ):

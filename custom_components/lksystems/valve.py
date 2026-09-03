@@ -68,13 +68,36 @@ class LKCubicSecureValve(CoordinatorEntity[LKSystemCoordinator], ValveEntity):
 
     @property
     def is_closed(self) -> bool | None:
-        """Return True if the valve is closed, None if not yet known."""
+        """Return True if the valve is closed, None if not yet known.
+
+        Not consulted while is_opening/is_closing is set - ValveEntity's
+        own state property checks those first - so this doesn't need to
+        guard against showing a stale mid-action reading itself.
+        """
         valve_state = cubic_secure_configuration(self.coordinator, self._device_identity).get(
             "valveState"
         )
         if valve_state is None:
             return None
         return valve_state == CUBIC_SECURE_VALVE_STATE_CLOSED
+
+    @property
+    def is_opening(self) -> bool:
+        """Return True while an open write is pending confirmation.
+
+        Takes priority over is_closed in ValveEntity's own state property,
+        so the entity shows a steady "opening" for the real time the
+        motor takes, instead of flashing through whatever intermediate
+        (possibly stale) reads the confirmation retries publish along the
+        way - see LKSystemCoordinator.valve_action_pending.
+        """
+        return self.coordinator.valve_action_pending.get(self._device_identity) is False
+
+    @property
+    def is_closing(self) -> bool:
+        """Return True while a close write is pending confirmation - see
+        is_opening above."""
+        return self.coordinator.valve_action_pending.get(self._device_identity) is True
 
     async def async_open_valve(self) -> None:
         """Open the valve."""

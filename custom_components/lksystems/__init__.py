@@ -306,6 +306,16 @@ class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
         # method's own docstring.
         self._valve_action_unsub: dict[str, CALLBACK_TYPE] = {}
 
+        # Whether a device is currently mid-open/close, per device
+        # identity - True while closing, False while opening, absent once
+        # confirmed (or given up on). valve.py's is_closing/is_opening
+        # read this directly, so the entity shows a transitional state
+        # for the real time the physical motor takes to move instead of
+        # flashing through whatever intermediate (possibly stale) reads
+        # _schedule_valve_state_confirmation()'s retries publish along
+        # the way.
+        self.valve_action_pending: dict[str, bool] = {}
+
         # Initialize coordinator with update interval
         super().__init__(
             hass,
@@ -659,15 +669,16 @@ class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
         actually reached the requested state, giving up after
         VALVE_ACTION_MAX_RETRY_SECONDS and leaving it to the regular poll.
 
-        Without this, valve.py's single immediate force-refresh right
-        after the write reads a stale pre-action snapshot - the physical
-        motor takes on the order of 10-30s to finish moving (confirmed
-        against a real device) and the API doesn't report the change
-        until then - and publishes it as if it were final, flipping the
-        entity right back to the old state until the next regular poll,
-        possibly minutes later.
+        Also marks the device pending in valve_action_pending immediately
+        (before the first check even runs) and clears it once resolved -
+        see that attribute's own comment for why: without it, each
+        retry's own possibly-still-stale read would get shown as the
+        entity's literal open/closed state along the way, instead of a
+        steady "closing"/"opening" for the real time the motor takes.
         """
         self._cancel_valve_action_confirmation(device_identity)
+        self.valve_action_pending[device_identity] = expect_closed
+        self.async_update_listeners()
         retry_deadline = dt_util.utcnow() + timedelta(
             seconds=VALVE_ACTION_MAX_RETRY_SECONDS
         )
@@ -676,6 +687,16 @@ class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
             self._valve_action_unsub[device_identity] = async_track_point_in_time(
                 self.hass, _check_valve_state, when
             )
+
+        def _resolve() -> None:
+            self.valve_action_pending.pop(device_identity, None)
+            # force_cubic_secure_configuration_update() below already
+            # notified listeners once with this check's raw fetch -
+            # entities reading valve_action_pending (is_closing/
+            # is_opening) need a second notification to pick up that it
+            # just cleared, or they're stuck showing the transitional
+            # state until the next regular poll.
+            self.async_update_listeners()
 
         async def _check_valve_state(now: datetime) -> None:
             self._valve_action_unsub.pop(device_identity, None)
@@ -687,6 +708,7 @@ class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
             actually_closed = valve_state == CUBIC_SECURE_VALVE_STATE_CLOSED
 
             if actually_closed == expect_closed:
+                _resolve()
                 _LOGGER.debug(
                     "Valve %s confirmed %s",
                     device_identity,
@@ -694,6 +716,7 @@ class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
                 )
                 return
             if now >= retry_deadline:
+                _resolve()
                 _LOGGER.debug(
                     "Giving up on confirming valve %s reached the requested "
                     "state after %ss - leaving it to the regular poll",
