@@ -122,3 +122,7 @@ CI runs the test suite automatically on every pull request.
 ### API documentation
 
 The integration uses the API exposed by LK System. [API documentation](https://lk-home-assistant-prod.developer.azure-api.net/)
+
+### Device documentation
+
+[LK CubicSecure user manual](https://www.lksystems.se/download/107397/en.40.c.12.01_lk-cubicsecure-user-manual_2025.pdf) (LK Systems' own PDF, linked rather than mirrored here - not ours to redistribute, and LK updates it independently) - covers the device's status LED colors/patterns and beep codes, among other things, useful when a change here needs to be checked against real device behavior.
