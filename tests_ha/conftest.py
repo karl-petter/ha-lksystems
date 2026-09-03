@@ -131,6 +131,11 @@ class FakeLKSystemsManager:
         # Call log, for tests that want to assert *what* was called.
         self.calls: list[tuple] = []
 
+        # Simulates a real open/close write taking a while - the write
+        # goes through the same unbounded Retry-After-honoring network
+        # layer as any other request, so it can itself take a long time.
+        self.valve_write_delay: float = 0
+
     async def __aenter__(self):
         return self
 
@@ -212,9 +217,13 @@ class FakeLKSystemsManager:
         return self.set_thermostat_temperature_result
 
     async def cubic_secure_close_valve(self, cubic_identity):
+        if self.valve_write_delay:
+            await asyncio.sleep(self.valve_write_delay)
         self.calls.append(("cubic_secure_close_valve", cubic_identity))
 
     async def cubic_secure_open_valve(self, cubic_identity):
+        if self.valve_write_delay:
+            await asyncio.sleep(self.valve_write_delay)
         self.calls.append(("cubic_secure_open_valve", cubic_identity))
 
     async def cubic_secure_pause_leak_detection(self, cubic_identity, seconds):

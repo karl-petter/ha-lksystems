@@ -191,3 +191,28 @@ async def test_assumes_success_if_never_confirmed_within_the_max_retry_window(
         await asyncio.sleep(0.3)  # comfortably past the (patched) tiny window
 
     assert hass.states.get(valve_entity_id).state == "closed"
+
+
+async def test_shows_opening_immediately_even_if_the_write_itself_is_slow(
+    hass, fake_manager
+):
+    """The write (login, then the API call) goes through the same
+    unbounded Retry-After-honoring network layer as any other request -
+    it can itself take a long time, confirmed missing live: a slow write
+    left the entity showing nothing until the frontend's own optimistic
+    toggle reverted. The entity must show "opening" the instant the user
+    acts, not only once that write finishes."""
+    fake_manager.cubic_configuration_data = build_cubic_configuration(valve_state="closed")
+    await setup_entry(hass, fake_manager)
+    valve_entity_id = entity_id(hass, "valve", _valve_unique_id(CUBIC_IDENTITY))
+    fake_manager.valve_write_delay = 0.2  # far longer than this test waits below
+
+    with patch_all_managers(fake_manager):
+        call_task = hass.async_create_task(
+            hass.services.async_call(
+                "valve", "open_valve", {"entity_id": valve_entity_id}, blocking=True
+            )
+        )
+        await asyncio.sleep(0.02)  # well before the write itself would finish
+        assert hass.states.get(valve_entity_id).state == "opening"
+        await call_task

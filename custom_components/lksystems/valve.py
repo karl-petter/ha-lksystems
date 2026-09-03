@@ -108,8 +108,16 @@ class LKCubicSecureValve(CoordinatorEntity[LKSystemCoordinator], ValveEntity):
         await self._async_call_valve_service("close_valve")
 
     async def _async_call_valve_service(self, service: str) -> None:
+        expect_closed = service == "close_valve"
+        # Marked pending before the write below, not just once its
+        # confirmation retries start - the write itself (login, then the
+        # API call) can take a while too (see
+        # coordinator.mark_valve_action_pending's own docstring).
+        self.coordinator.mark_valve_action_pending(self._device_identity, expect_closed)
         called = await async_call_cubic_secure_service(self.hass, self._device_identity, service)
         if called:
             self.coordinator._schedule_valve_state_confirmation(
-                self._device_identity, service == "close_valve"
+                self._device_identity, expect_closed
             )
+        else:
+            self.coordinator.clear_valve_action_pending(self._device_identity)

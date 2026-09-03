@@ -662,6 +662,36 @@ class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
         if unsub := self._leak_detection_refresh_unsub.pop(device_identity, None):
             unsub()
 
+    def mark_valve_action_pending(
+        self, device_identity: str, expect_closed: bool
+    ) -> None:
+        """Show a device as opening/closing straight away.
+
+        Called by valve.py right before it even issues the open/close
+        write, not just once _schedule_valve_state_confirmation()'s
+        confirmation retries start - the write itself (login and the API
+        call) goes through the same unbounded Retry-After-honoring
+        network layer as any other request, so it can itself take a long
+        time (confirmed missing live: a slow write left the entity
+        showing nothing until the frontend's own optimistic toggle
+        reverted). See valve_action_pending's own comment for why
+        tracking this at all matters.
+        """
+        self._cancel_valve_action_confirmation(device_identity)
+        self.valve_action_pending[device_identity] = expect_closed
+        self.async_update_listeners()
+
+    def clear_valve_action_pending(self, device_identity: str) -> None:
+        """Abort a pending open/close confirmation without assuming
+        anything about the outcome - for when the write itself never
+        got attempted (e.g. the device wasn't found), so there's nothing
+        to confirm and nothing will otherwise resolve the pending state
+        mark_valve_action_pending() just set.
+        """
+        self._cancel_valve_action_confirmation(device_identity)
+        self.valve_action_pending.pop(device_identity, None)
+        self.async_update_listeners()
+
     def _schedule_valve_state_confirmation(
         self, device_identity: str, expect_closed: bool
     ) -> None:
@@ -670,17 +700,8 @@ class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
         actually reached the requested state, giving up after
         VALVE_ACTION_MAX_RETRY_SECONDS - see that constant's own comment
         for what happens then.
-
-        Also marks the device pending in valve_action_pending immediately
-        (before the first check even runs) and clears it once resolved -
-        see that attribute's own comment for why: without it, each
-        retry's own possibly-still-stale read would get shown as the
-        entity's literal open/closed state along the way, instead of a
-        steady "closing"/"opening" for the real time the motor takes.
         """
-        self._cancel_valve_action_confirmation(device_identity)
-        self.valve_action_pending[device_identity] = expect_closed
-        self.async_update_listeners()
+        self.mark_valve_action_pending(device_identity, expect_closed)
         retry_deadline = dt_util.utcnow() + timedelta(
             seconds=VALVE_ACTION_MAX_RETRY_SECONDS
         )

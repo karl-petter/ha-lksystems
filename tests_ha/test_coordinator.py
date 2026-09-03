@@ -649,6 +649,51 @@ async def _valve_action_coordinator(hass, fake_manager):
     return coordinator
 
 
+class TestMarkAndClearValveActionPending:
+    """valve.py calls these directly around the write itself (not just
+    the confirmation retry-loop), so the entity shows "opening"/"closing"
+    the instant the user acts - the write goes through the same
+    unbounded Retry-After-honoring network layer as any other request
+    and can itself take a long time, confirmed missing live: a slow
+    write left the entity showing nothing until the frontend's own
+    optimistic toggle reverted."""
+
+    async def test_mark_sets_pending_and_notifies(self, hass, fake_manager):
+        coordinator = await _valve_action_coordinator(hass, fake_manager)
+        notified = []
+        coordinator.async_add_listener(lambda: notified.append(True))
+
+        coordinator.mark_valve_action_pending(CUBIC_IDENTITY, True)
+
+        assert coordinator.valve_action_pending[CUBIC_IDENTITY] is True
+        assert notified
+        await coordinator.async_shutdown()  # cancel the now-listened-for refresh interval
+
+    async def test_clear_pops_pending_and_notifies(self, hass, fake_manager):
+        """Used when the write itself never got attempted (e.g. the
+        device wasn't found) - nothing to confirm, so don't leave the
+        entity stuck showing a transitional state with no retry loop
+        ever going to resolve it."""
+        coordinator = await _valve_action_coordinator(hass, fake_manager)
+        coordinator.mark_valve_action_pending(CUBIC_IDENTITY, True)
+        notified = []
+        coordinator.async_add_listener(lambda: notified.append(True))
+
+        coordinator.clear_valve_action_pending(CUBIC_IDENTITY)
+
+        assert CUBIC_IDENTITY not in coordinator.valve_action_pending
+        assert notified
+        await coordinator.async_shutdown()  # cancel the now-listened-for refresh interval
+
+    async def test_clear_cancels_a_pending_confirmation_retry(self, hass, fake_manager):
+        coordinator = await _valve_action_coordinator(hass, fake_manager)
+        coordinator._schedule_valve_state_confirmation(CUBIC_IDENTITY, True)
+
+        coordinator.clear_valve_action_pending(CUBIC_IDENTITY)
+
+        assert CUBIC_IDENTITY not in coordinator._valve_action_unsub
+
+
 class TestValveStateConfirmation:
     """Confirms an open/close write actually took effect, retrying past
     the real-world lag between sending the command and the physical
