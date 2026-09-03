@@ -34,6 +34,10 @@ DEFAULT_PAUSE_LEAK_DETECTION_SECONDS: Final = 3600
 PAUSE_LEAK_DETECTION_MIN_SECONDS: Final = 60
 PAUSE_LEAK_DETECTION_MAX_SECONDS: Final = 86400
 
+# The API reports a Cubic Secure's valveState as "closed" for a shut
+# valve; any other value is treated as open.
+CUBIC_SECURE_VALVE_STATE_CLOSED: Final = "closed"
+
 # Once a pause's target end time is reached, poll the cloud at this
 # interval until it confirms the pause is actually over, so "Leak
 # Detection Paused Until" clears promptly instead of waiting on the next
