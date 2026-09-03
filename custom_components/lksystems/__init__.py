@@ -37,12 +37,15 @@ from homeassistant.helpers import config_validation as cv
 from .const import (
     CONF_UPDATE_INTERVAL,
     CUBIC_SECURE_MODEL,
+    CUBIC_SECURE_VALVE_STATE_CLOSED,
     DEFAULT_UPDATE_INTERVAL,
     DOMAIN,
     LEAK_DETECTION_EXPIRY_MAX_RETRY_SECONDS,
     LEAK_DETECTION_EXPIRY_RETRY_INTERVAL_SECONDS,
     LEAK_DETECTION_LOCAL_WRITE_GRACE_SECONDS,
     MANUFACTURER,
+    VALVE_ACTION_MAX_RETRY_SECONDS,
+    VALVE_ACTION_RETRY_INTERVAL_SECONDS,
 )
 from .pylksystems import (
     LKSystemsManager,
@@ -297,6 +300,11 @@ class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
         # stale value until the next regular poll (up to a full
         # update_interval later) picked up the change.
         self._leak_detection_refresh_unsub: dict[str, CALLBACK_TYPE] = {}
+
+        # Cancel handle for each device's pending
+        # _schedule_valve_state_confirmation() call, if any - see that
+        # method's own docstring.
+        self._valve_action_unsub: dict[str, CALLBACK_TYPE] = {}
 
         # Initialize coordinator with update interval
         super().__init__(
@@ -643,15 +651,78 @@ class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
         if unsub := self._leak_detection_refresh_unsub.pop(device_identity, None):
             unsub()
 
+    def _schedule_valve_state_confirmation(
+        self, device_identity: str, expect_closed: bool
+    ) -> None:
+        """After an open/close write, poll the cloud every
+        VALVE_ACTION_RETRY_INTERVAL_SECONDS until it confirms the valve
+        actually reached the requested state, giving up after
+        VALVE_ACTION_MAX_RETRY_SECONDS and leaving it to the regular poll.
+
+        Without this, valve.py's single immediate force-refresh right
+        after the write reads a stale pre-action snapshot - the physical
+        motor takes on the order of 10-30s to finish moving (confirmed
+        against a real device) and the API doesn't report the change
+        until then - and publishes it as if it were final, flipping the
+        entity right back to the old state until the next regular poll,
+        possibly minutes later.
+        """
+        self._cancel_valve_action_confirmation(device_identity)
+        retry_deadline = dt_util.utcnow() + timedelta(
+            seconds=VALVE_ACTION_MAX_RETRY_SECONDS
+        )
+
+        def _track_at(when: datetime) -> None:
+            self._valve_action_unsub[device_identity] = async_track_point_in_time(
+                self.hass, _check_valve_state, when
+            )
+
+        async def _check_valve_state(now: datetime) -> None:
+            self._valve_action_unsub.pop(device_identity, None)
+            if not await self.force_cubic_secure_configuration_update(device_identity):
+                return
+            valve_state = self.data["cubic_devices"][device_identity][
+                "configuration"
+            ].get("valveState")
+            actually_closed = valve_state == CUBIC_SECURE_VALVE_STATE_CLOSED
+
+            if actually_closed == expect_closed:
+                _LOGGER.debug(
+                    "Valve %s confirmed %s",
+                    device_identity,
+                    "closed" if expect_closed else "open",
+                )
+                return
+            if now >= retry_deadline:
+                _LOGGER.debug(
+                    "Giving up on confirming valve %s reached the requested "
+                    "state after %ss - leaving it to the regular poll",
+                    device_identity,
+                    VALVE_ACTION_MAX_RETRY_SECONDS,
+                )
+                return  # give up - the regular poll will pick it up eventually
+
+            _track_at(now + timedelta(seconds=VALVE_ACTION_RETRY_INTERVAL_SECONDS))
+
+        _track_at(dt_util.utcnow() + timedelta(seconds=VALVE_ACTION_RETRY_INTERVAL_SECONDS))
+
+    def _cancel_valve_action_confirmation(self, device_identity: str) -> None:
+        """Cancel a device's pending valve-state check, if one is scheduled."""
+        if unsub := self._valve_action_unsub.pop(device_identity, None):
+            unsub()
+
     async def async_shutdown(self) -> None:
         """Cancel any scheduled call, and ignore new runs.
 
-        Also cancels every pending leak-detection expiry check - they'd
-        otherwise fire against a torn-down coordinator after unload.
+        Also cancels every pending leak-detection expiry check and
+        valve-state confirmation - they'd otherwise fire against a
+        torn-down coordinator after unload.
         """
         await super().async_shutdown()
         for device_identity in list(self._leak_detection_refresh_unsub):
             self._cancel_leak_detection_expiry_refresh(device_identity)
+        for device_identity in list(self._valve_action_unsub):
+            self._cancel_valve_action_confirmation(device_identity)
 
     async def _update_cubic_secure_configuration(
         self, device_identity: str, *, force_update: bool

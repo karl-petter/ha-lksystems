@@ -38,6 +38,20 @@ PAUSE_LEAK_DETECTION_MAX_SECONDS: Final = 86400
 # valve; any other value is treated as open.
 CUBIC_SECURE_VALVE_STATE_CLOSED: Final = "closed"
 
+# After an open/close write, poll the cloud at this interval until it
+# confirms the valve actually reached the requested state - the physical
+# motor takes on the order of 10-30s to finish moving (confirmed against
+# a real device) and the API doesn't report the change until then, so a
+# single immediate check right after the write reads a stale pre-action
+# snapshot.
+VALVE_ACTION_RETRY_INTERVAL_SECONDS: Final = 5
+
+# Stop retrying this long after an open/close write and fall back to the
+# regular poll - generous over the observed 10-30s motor travel time to
+# also allow for the cloud's own lag reporting it, not a value normal
+# operation is expected to reach.
+VALVE_ACTION_MAX_RETRY_SECONDS: Final = 90
+
 # Once a pause's target end time is reached, poll the cloud at this
 # interval until it confirms the pause is actually over, so "Leak
 # Detection Paused Until" clears promptly instead of waiting on the next

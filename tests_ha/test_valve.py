@@ -5,11 +5,15 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
+from homeassistant.util import dt as dt_util
+from pytest_homeassistant_custom_component.common import async_fire_time_changed
 
-from custom_components.lksystems.const import DOMAIN
+from custom_components.lksystems.const import DOMAIN, VALVE_ACTION_RETRY_INTERVAL_SECONDS
 
 from .conftest import (
     CUBIC_IDENTITY,
@@ -85,6 +89,13 @@ async def test_action_calls_the_client_and_refreshes(
         await hass.services.async_call(
             "valve", ha_service, {"entity_id": valve_entity_id}, blocking=True
         )
+        # The confirmation that the valve actually reached the requested
+        # state is scheduled to check a few seconds later, not
+        # immediately - see LKSystemCoordinator._schedule_valve_state_confirmation.
+        async_fire_time_changed(
+            hass, dt_util.utcnow() + timedelta(seconds=VALVE_ACTION_RETRY_INTERVAL_SECONDS)
+        )
+        await hass.async_block_till_done()
 
     assert (client_call, CUBIC_IDENTITY) in fake_manager.calls
     assert hass.states.get(valve_entity_id).state == resulting_state
