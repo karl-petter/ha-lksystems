@@ -724,8 +724,9 @@ class TestValveStateConfirmation:
 
     async def test_gives_up_after_the_max_retry_window(self, hass, fake_manager):
         """A safety cap for if the valve never reports the expected state
-        (e.g. it's jammed, or offline) - falls back to the regular poll
-        rather than retrying forever."""
+        (e.g. it's jammed, or offline) - assumes the write succeeded
+        (HA already issued it) rather than retrying forever or leaving
+        the entity showing the stale pre-action reading."""
         coordinator = await _valve_action_coordinator(hass, fake_manager)
         fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
             build_cubic_configuration(valve_state="open")
@@ -745,14 +746,14 @@ class TestValveStateConfirmation:
                 )
                 await hass.async_block_till_done()
 
-        # Never confirmed - still shows the pre-action state - but no
-        # retry left pending (the test's own teardown would fail on a
-        # lingering timer if one were).
+        # Never confirmed by the cloud - shows the requested state anyway
+        # - but no retry left pending (the test's own teardown would fail
+        # on a lingering timer if one were).
         assert (
             coordinator.data["cubic_devices"][CUBIC_IDENTITY]["configuration"][
                 "valveState"
             ]
-            == "open"
+            == "closed"
         )
 
     async def test_marks_the_device_pending_as_soon_as_scheduled(

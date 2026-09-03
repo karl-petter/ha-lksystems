@@ -38,6 +38,7 @@ from .const import (
     CONF_UPDATE_INTERVAL,
     CUBIC_SECURE_MODEL,
     CUBIC_SECURE_VALVE_STATE_CLOSED,
+    CUBIC_SECURE_VALVE_STATE_OPEN,
     DEFAULT_UPDATE_INTERVAL,
     DOMAIN,
     LEAK_DETECTION_EXPIRY_MAX_RETRY_SECONDS,
@@ -667,7 +668,8 @@ class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
         """After an open/close write, poll the cloud every
         VALVE_ACTION_RETRY_INTERVAL_SECONDS until it confirms the valve
         actually reached the requested state, giving up after
-        VALVE_ACTION_MAX_RETRY_SECONDS and leaving it to the regular poll.
+        VALVE_ACTION_MAX_RETRY_SECONDS - see that constant's own comment
+        for what happens then.
 
         Also marks the device pending in valve_action_pending immediately
         (before the first check even runs) and clears it once resolved -
@@ -700,8 +702,16 @@ class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
 
         async def _check_valve_state(now: datetime) -> None:
             self._valve_action_unsub.pop(device_identity, None)
+            fetch_started_at = dt_util.utcnow()
             if not await self.force_cubic_secure_configuration_update(device_identity):
                 return
+            # LK's API rate-limits this specific endpoint (confirmed
+            # empirically) and pylksystems honors its Retry-After, so a
+            # single attempt can genuinely take tens of seconds - measured
+            # here so the next check (below) doesn't fire on schedule
+            # right into the same rate limit that just delayed this one.
+            fetch_duration = dt_util.utcnow() - fetch_started_at
+
             valve_state = self.data["cubic_devices"][device_identity][
                 "configuration"
             ].get("valveState")
@@ -716,16 +726,33 @@ class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
                 )
                 return
             if now >= retry_deadline:
+                # HA already issued the write - assume it succeeded rather
+                # than leave the entity showing a stale pre-action reading
+                # for longer than VALVE_ACTION_MAX_RETRY_SECONDS. Wrong
+                # only if the write itself failed downstream of the API
+                # call succeeding, in which case the next regular poll
+                # corrects it.
+                self.data["cubic_devices"][device_identity]["configuration"][
+                    "valveState"
+                ] = (
+                    CUBIC_SECURE_VALVE_STATE_CLOSED
+                    if expect_closed
+                    else CUBIC_SECURE_VALVE_STATE_OPEN
+                )
                 _resolve()
                 _LOGGER.debug(
                     "Giving up on confirming valve %s reached the requested "
-                    "state after %ss - leaving it to the regular poll",
+                    "state after %ss - assuming it did, the regular poll "
+                    "will correct this if not",
                     device_identity,
                     VALVE_ACTION_MAX_RETRY_SECONDS,
                 )
-                return  # give up - the regular poll will pick it up eventually
+                return
 
-            _track_at(now + timedelta(seconds=VALVE_ACTION_RETRY_INTERVAL_SECONDS))
+            next_delay = max(
+                timedelta(seconds=VALVE_ACTION_RETRY_INTERVAL_SECONDS), fetch_duration
+            )
+            _track_at(now + next_delay)
 
         _track_at(dt_util.utcnow() + timedelta(seconds=VALVE_ACTION_RETRY_INTERVAL_SECONDS))
 

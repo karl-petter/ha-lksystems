@@ -35,8 +35,11 @@ PAUSE_LEAK_DETECTION_MIN_SECONDS: Final = 60
 PAUSE_LEAK_DETECTION_MAX_SECONDS: Final = 86400
 
 # The API reports a Cubic Secure's valveState as "closed" for a shut
-# valve; any other value is treated as open.
+# valve; any other value is treated as open - "open" is the value the
+# API itself actually reports for that case (confirmed against a real
+# device), not just this integration's own placeholder.
 CUBIC_SECURE_VALVE_STATE_CLOSED: Final = "closed"
+CUBIC_SECURE_VALVE_STATE_OPEN: Final = "open"
 
 # After an open/close write, poll the cloud at this interval until it
 # confirms the valve actually reached the requested state - the physical
@@ -46,11 +49,14 @@ CUBIC_SECURE_VALVE_STATE_CLOSED: Final = "closed"
 # snapshot.
 VALVE_ACTION_RETRY_INTERVAL_SECONDS: Final = 5
 
-# Stop retrying this long after an open/close write and fall back to the
-# regular poll - generous over the observed 10-30s motor travel time to
-# also allow for the cloud's own lag reporting it, not a value normal
-# operation is expected to reach.
-VALVE_ACTION_MAX_RETRY_SECONDS: Final = 90
+# Stop retrying this long after an open/close write - the longest the
+# entity should ever show a transitional "closing"/"opening" state
+# (confirmed real motor travel time tops out around 25s). Past this, the
+# entity optimistically shows the state the write actually requested
+# rather than lingering on a stale reading - HA already issued the
+# command, so assume it succeeded, and let the next regular poll quietly
+# correct it if it didn't.
+VALVE_ACTION_MAX_RETRY_SECONDS: Final = 30
 
 # Once a pause's target end time is reached, poll the cloud at this
 # interval until it confirms the pause is actually over, so "Leak

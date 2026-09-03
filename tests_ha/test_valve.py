@@ -13,7 +13,11 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import async_fire_time_changed
 
-from custom_components.lksystems.const import DOMAIN, VALVE_ACTION_RETRY_INTERVAL_SECONDS
+from custom_components.lksystems.const import (
+    DOMAIN,
+    VALVE_ACTION_MAX_RETRY_SECONDS,
+    VALVE_ACTION_RETRY_INTERVAL_SECONDS,
+)
 
 from .conftest import (
     CUBIC_IDENTITY,
@@ -165,3 +169,32 @@ async def test_two_cubic_secure_devices_get_independent_valves(
     # open and the second closed - see conftest.py.
     assert hass.states.get(first_id).state == "open"
     assert hass.states.get(second_id).state == "closed"
+
+
+async def test_assumes_success_if_never_confirmed_within_the_max_retry_window(
+    hass, fake_manager
+):
+    """HA already issued the write - if the cloud never confirms it within
+    VALVE_ACTION_MAX_RETRY_SECONDS, the entity shows the requested state
+    rather than getting stuck on "closing"/"opening" or reverting to the
+    stale pre-action reading."""
+    fake_manager.cubic_configuration_data = build_cubic_configuration(valve_state="open")
+    await setup_entry(hass, fake_manager)
+    valve_entity_id = entity_id(hass, "valve", _valve_unique_id(CUBIC_IDENTITY))
+    fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
+        build_cubic_configuration(valve_state="open")
+    )
+
+    steps = VALVE_ACTION_MAX_RETRY_SECONDS // VALVE_ACTION_RETRY_INTERVAL_SECONDS + 2
+    start = dt_util.utcnow()
+    with patch_all_managers(fake_manager):
+        await hass.services.async_call(
+            "valve", "close_valve", {"entity_id": valve_entity_id}, blocking=True
+        )
+        for step in range(1, steps + 1):
+            async_fire_time_changed(
+                hass, start + timedelta(seconds=step * VALVE_ACTION_RETRY_INTERVAL_SECONDS)
+            )
+            await hass.async_block_till_done()
+
+    assert hass.states.get(valve_entity_id).state == "closed"
