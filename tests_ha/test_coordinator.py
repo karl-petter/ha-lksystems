@@ -817,36 +817,34 @@ class TestValveStateConfirmation:
 
         assert CUBIC_IDENTITY not in coordinator.valve_action_pending
 
-    async def test_a_single_slow_check_gives_up_without_retrying_again(
+    async def test_abandons_a_fetch_that_would_outlast_the_retry_window(
         self, hass, fake_manager
     ):
         """Regression test for a real bug found live: LK's API can
         rate-limit this specific endpoint with a Retry-After long enough
         that pylksystems' own (correct) wait for it can alone exceed the
         whole retry window (a 93s Retry-After was observed on one real
-        attempt). The give-up decision has to catch that on its own -
-        comparing against a timestamp captured before the slow fetch
-        under-counts the elapsed time and would schedule yet another
-        retry into the same rate limit that just delayed this one."""
+        attempt). Waiting for such a fetch to finish before checking the
+        deadline would leave the entity showing a transitional state for
+        as long as LK's server says to wait, however much longer than
+        VALVE_ACTION_MAX_RETRY_SECONDS that is - the fetch itself has to
+        be abandoned once its own budget runs out, not just ignored
+        afterwards."""
         coordinator = await _valve_action_coordinator(hass, fake_manager)
         fake_manager.cubic_configurations_by_device[CUBIC_IDENTITY] = (
             build_cubic_configuration(valve_state="open")
         )
-        # Longer than the patched max retry window below - simulates a
-        # single fetch whose own Retry-After wait alone blows the budget.
-        fake_manager.get_cubic_secure_configuration_delay = 0.1
+        # Far longer than the patched max retry window below and than
+        # this test's own real wait - if the fetch weren't abandoned, the
+        # assertions below would still find it pending/unresolved.
+        fake_manager.get_cubic_secure_configuration_delay = 5
 
         max_retry, retry_interval = tiny_valve_retry_timings()
         with max_retry, retry_interval, _patch_manager(fake_manager):
             coordinator._schedule_valve_state_confirmation(CUBIC_IDENTITY, True)
             await asyncio.sleep(0.3)
 
-        assert (
-            fake_manager.calls.count(
-                ("get_cubic_secure_configuration", CUBIC_IDENTITY, True)
-            )
-            == 1
-        ), "should give up after the one slow attempt, not retry again"
+        assert CUBIC_IDENTITY not in coordinator.valve_action_pending
         assert (
             coordinator.data["cubic_devices"][CUBIC_IDENTITY]["configuration"][
                 "valveState"
