@@ -5,6 +5,7 @@ __pycache__
 .pytest_cache/
 TODO.local.md
 .vscode/
-.claude/
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
 .mcp.json
 scratch/

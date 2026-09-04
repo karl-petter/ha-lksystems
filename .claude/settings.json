@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv-test/bin/python3 -m pytest *)",
+      "Bash(.venv-test/bin/python -m pytest *)",
+      "Bash(source .venv-test/bin/activate && python -m pytest *)",
+      "Bash(.venv-test/bin/python3 -m py_compile *)",
+      "Bash(git fetch *)"
+    ]
+  }
+}
