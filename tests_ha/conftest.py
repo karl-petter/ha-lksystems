@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from contextlib import contextmanager
 from unittest.mock import patch
 
 import pytest
@@ -102,6 +103,12 @@ class FakeLKSystemsManager:
         # single-device tests can keep using the simpler singular fields.
         self.cubic_measurements_by_device: dict[str, dict] = {}
         self.cubic_configurations_by_device: dict[str, dict] = {}
+        # Per-device override for what get_cubic_secure_configuration returns
+        # when *not* force_update - distinct from cubic_configurations_by_device
+        # above (used otherwise, and always when force_update=True) - lets
+        # tests simulate the real API's own server-side cache (the bypass=0
+        # path) serving a stale snapshot independently of the live value.
+        self.cubic_configurations_cached_by_device: dict[str, dict] = {}
 
         # Configurable outcomes for each call, so tests can force failures.
         self.login_result = True
@@ -179,9 +186,19 @@ class FakeLKSystemsManager:
             ("get_cubic_secure_configuration", device_identity, force_update)
         )
         if self.get_cubic_secure_configuration_result:
-            self.cubic_secure_configuration = self.cubic_configurations_by_device.get(
-                device_identity, self.cubic_configuration_data
-            )
+            if (
+                not force_update
+                and device_identity in self.cubic_configurations_cached_by_device
+            ):
+                self.cubic_secure_configuration = (
+                    self.cubic_configurations_cached_by_device[device_identity]
+                )
+            else:
+                self.cubic_secure_configuration = (
+                    self.cubic_configurations_by_device.get(
+                        device_identity, self.cubic_configuration_data
+                    )
+                )
         return self.get_cubic_secure_configuration_result
 
     async def set_thermostat_temperature(self, device_id, temperature):
@@ -357,13 +374,22 @@ def build_cubic_measurement(volume_total: int = 45000) -> dict:
     }
 
 
-def build_cubic_configuration(valve_state: str = "open") -> dict:
+def build_cubic_configuration(valve_state: str = "open", mute_leak: int = 0) -> dict:
     return {
         "cacheUpdated": int(time.time()),
         "valveState": valve_state,
         "firmwareVersion": "1.2.3",
         "hardwareVersion": 4,
+        "muteLeak": mute_leak,
     }
+
+
+def build_live_config_without_mute_leak(**kwargs) -> dict:
+    """A cubic configuration as the real bypass/"live" endpoint returns it -
+    it never carries muteLeak at all, unlike the cached endpoint."""
+    config = build_cubic_configuration(**kwargs)
+    del config["muteLeak"]
+    return config
 
 
 def configure_fake_manager_with_sample_data(manager: FakeLKSystemsManager) -> None:
@@ -428,6 +454,44 @@ def entity_id(hass, platform: str, unique_id: str) -> str:
     found = er.async_get(hass).async_get_entity_id(platform, DOMAIN, unique_id)
     assert found is not None, f"no {platform} entity registered for {unique_id!r}"
     return found
+
+
+def patch_coordinator_manager(manager: FakeLKSystemsManager):
+    """Patch the LKSystemsManager the coordinator itself constructs
+    (setup, polling refresh)."""
+    return patch("custom_components.lksystems.LKSystemsManager", return_value=manager)
+
+
+def patch_services_manager(manager: FakeLKSystemsManager):
+    """Patch the LKSystemsManager used by services.py's own handlers.
+
+    Needed by anything that ends up going through a service call - either
+    directly (hass.services.async_call) or indirectly (an entity whose
+    action delegates to a service, e.g. button.py's pause-leak-detection
+    button) - since each service handler opens its own LKSystemsManager
+    rather than reusing the one patched for coordinator setup.
+    """
+    return patch(
+        "custom_components.lksystems.services.LKSystemsManager", return_value=manager
+    )
+
+
+@contextmanager
+def patch_all_managers(manager: FakeLKSystemsManager):
+    """Patch every place LKSystemsManager gets constructed: the coordinator
+    (its polling refresh) and services.py (service handlers).
+
+    patch_services_manager() alone only covers a service call itself;
+    needed on top of that by anything that also triggers a coordinator
+    refresh in the same action (e.g. button.py's pause-leak-detection
+    button, which refreshes the paused-until sensor after pausing),
+    since that refresh would otherwise fall through to a real, unpatched
+    LKSystemsManager and attempt a genuine network call.
+    """
+    with patch_coordinator_manager(manager), patch_services_manager(manager):
+        yield
+
+
 @pytest.fixture
 def fake_manager_with_two_cubic_devices() -> FakeLKSystemsManager:
     """A FakeLKSystemsManager pre-populated with two Cubic Secure devices
@@ -447,9 +511,9 @@ async def setup_entry(
 ) -> MockConfigEntry:
     """Drive a real config-entry setup against a FakeLKSystemsManager.
 
-    Runs the coordinator's first refresh and both the sensor.py and
-    climate.py platforms' async_setup_entry() for real, so tests can inspect
-    the entities/entity registry they actually produce.
+    Runs the coordinator's first refresh and every platform's
+    async_setup_entry() for real (see __init__.py's PLATFORMS), so tests can
+    inspect the entities/entity registry they actually produce.
     """
     entry = MockConfigEntry(
         domain=DOMAIN,
@@ -457,10 +521,19 @@ async def setup_entry(
         options=options or {},
     )
     entry.add_to_hass(hass)
-    with patch("custom_components.lksystems.LKSystemsManager", return_value=manager):
+    with patch_coordinator_manager(manager):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
     return entry
+
+
+def pause_leak_detection_duration_unique_id(device_identity: str) -> str:
+    """unique_id of a device's "Pause Duration" number entity.
+
+    Shared by test_number.py (which owns the entity) and test_button.py
+    (which needs to look it up to drive the paired button's tests).
+    """
+    return f"LkUid_pause_leak_detection_duration_{device_identity}"
 
 
 def entity_id(hass, platform: str, unique_id: str) -> str:

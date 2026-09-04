@@ -28,6 +28,36 @@ CONF_UPDATE_INTERVAL = "update_interval"
 # Default update interval in minutes
 DEFAULT_UPDATE_INTERVAL = 5
 
+# Default/bounds (in seconds) for the "Pause Duration" number
+# entity. The default matches the pause_leak_detection service's own default.
+DEFAULT_PAUSE_LEAK_DETECTION_SECONDS: Final = 3600
+PAUSE_LEAK_DETECTION_MIN_SECONDS: Final = 60
+PAUSE_LEAK_DETECTION_MAX_SECONDS: Final = 86400
+
+# Once a pause's target end time is reached, poll the cloud at this
+# interval until it confirms the pause is actually over, so "Leak
+# Detection Paused Until" clears promptly instead of waiting on the next
+# regular poll. A single delayed check isn't reliable here - how long the
+# cloud lags behind the device's real state past a pause's nominal end
+# varies (confirmed empirically against the real API, but not to one
+# fixed figure) - so this retries instead of guessing a wait long enough
+# to always be right.
+LEAK_DETECTION_EXPIRY_RETRY_INTERVAL_SECONDS: Final = 15
+
+# Stop retrying this long past the target and fall back to the regular
+# poll - a safety cap for if the cloud never resolves (e.g. the device
+# has gone offline), not a value normal operation is expected to reach.
+LEAK_DETECTION_EXPIRY_MAX_RETRY_SECONDS: Final = 180
+
+# For this long after HA itself issues a pause/resume, don't let a
+# reconciliation pass override the local state with what the cloud
+# reports - the cloud's cached response can still be serving a pre-write
+# snapshot for tens of seconds (confirmed empirically against the real
+# API), and a poll landing in that window isn't caused by the write but
+# can still land inside it by coincidence. HA's own just-made write is
+# trusted for this window; past it, the cloud is trusted again.
+LEAK_DETECTION_LOCAL_WRITE_GRACE_SECONDS: Final = 60
+
 
 LK_CUBICSECURE_SENSORS: dict[str, SensorEntityDescription] = {
     "volumetotalday": SensorEntityDescription(
