@@ -220,6 +220,37 @@ async def set_thresholds_for_serial(
         return False
 
 
+async def set_pressure_test_schedule_for_serial(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    serial_number: str,
+    hour: int,
+    minute: int,
+) -> bool:
+    """Log in, write one device's pressure-test schedule, and confirm the
+    write by refreshing it with the same session - mirrors
+    set_thresholds_for_serial()'s own shape.
+    """
+    _LOGGER.info("Setting pressure test schedule for %s to %d:%02d", serial_number, hour, minute)
+    try:
+        coordinator = hass.data[DOMAIN][entry.entry_id]
+
+        async with _service_write_session(entry) as lk_inst:
+            success = await lk_inst.cubic_secure_set_pressure_test_schedule(
+                serial_number, hour, minute
+            )
+            if success:
+                await coordinator.refresh_cubic_secure_pressure_test_schedule_with_client(
+                    lk_inst, serial_number
+                )
+            return success
+    except _ServiceLoginFailed:
+        return False
+    except Exception as e:
+        _LOGGER.error("Error setting pressure test schedule: %s", e)
+        return False
+
+
 async def async_setup_services(hass: HomeAssistant, entry: ConfigEntry) -> None:
     @callback
     async def pause_leak_detection(call: ServiceCall) -> None:

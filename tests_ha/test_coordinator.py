@@ -458,6 +458,42 @@ class TestCubicFetchFailureFallback:
         )
 
 
+class TestPressureTestScheduleFetch:
+    """The pressure-test schedule lives at its own endpoint, separate
+    from configuration/thresholds (see get_cubic_secure_pressure_test_schedule's
+    own docstring) - fetched best-effort alongside it.
+    """
+
+    async def test_fetches_the_schedule(self, hass, fake_manager):
+        fake_manager.cubic_pressure_test_schedule_data = {"hour": 3, "minute": 11}
+        entry = _make_entry(hass)
+        coordinator = LKSystemCoordinator(hass, entry)
+
+        with _patch_manager(fake_manager):
+            data = await coordinator._async_update_data()
+
+        assert data["cubic_devices"][CUBIC_IDENTITY]["pressure_test_schedule"] == {
+            "hour": 3,
+            "minute": 11,
+        }
+
+    async def test_fetch_failure_does_not_abort_the_whole_update(
+        self, hass, fake_manager
+    ):
+        fake_manager.get_cubic_secure_pressure_test_schedule = AsyncMock(
+            side_effect=RuntimeError("boom")
+        )
+        entry = _make_entry(hass)
+        coordinator = LKSystemCoordinator(hass, entry)
+
+        with _patch_manager(fake_manager):
+            data = await coordinator._async_update_data()
+
+        cubic_device = data["cubic_devices"][CUBIC_IDENTITY]
+        assert "configuration" in cubic_device
+        assert "pressure_test_schedule" not in cubic_device
+
+
 class TestCubicConfigurationStalenessForceFetch:
 
     async def test_preserves_mute_leak_across_a_staleness_triggered_force_fetch(
@@ -1251,6 +1287,30 @@ class TestRefreshCubicSecureConfiguration:
             )
 
         assert result is False
+
+    async def test_updates_next_update_time_to_match_the_reset_schedule(
+        self, hass, fake_manager
+    ):
+        """Regression test: async_set_updated_data() (used to publish this
+        confirmation read) resets the coordinator's own refresh schedule
+        to fire update_interval from now, per its own docstring -
+        next_update_time must move with it, or a countdown sensor built
+        on it freezes at 0 until the rescheduled poll actually happens.
+        """
+        entry = _make_entry(hass)
+        coordinator = LKSystemCoordinator(hass, entry)
+
+        with _patch_manager(fake_manager):
+            data = await coordinator._async_update_data()
+        coordinator.async_set_updated_data(data)
+        stale_next_update_time = coordinator.data["next_update_time"]
+
+        with _patch_manager(fake_manager):
+            await coordinator.refresh_cubic_secure_configuration(CUBIC_IDENTITY)
+
+        assert coordinator.data["next_update_time"] != stale_next_update_time
+        refreshed = dt_util.parse_datetime(coordinator.data["next_update_time"])
+        assert refreshed > dt_util.utcnow()
 
 
 class TestLeakDetectionPausedUntilTracking:

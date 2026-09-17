@@ -10,7 +10,6 @@ import asyncio
 import base64
 import json
 from typing import Any, Dict
-import time
 
 # Make sure jwt is installed using: pip install pyjwt
 try:
@@ -75,6 +74,8 @@ PLATFORMS = [
     Platform.NUMBER,
     Platform.BUTTON,
     Platform.VALVE,
+    Platform.SWITCH,
+    Platform.TIME,
 ]
 
 
@@ -110,6 +111,7 @@ class LkCubicDeviceData(TypedDict):
     machine_info: LkStructureMachine
     last_measurement: LkCubicSecureResp
     configuration: LKCubicSecureConfigResp
+    pressure_test_schedule: "LKPressureTestSchedule"
 
 
 class LKCubicSecureConfigResp(TypedDict):
@@ -736,13 +738,15 @@ class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
             # for longer than VALVE_ACTION_MAX_RETRY_SECONDS. Wrong only
             # if the write itself failed downstream of a successful API
             # call, in which case the next regular poll corrects it.
-            self.data["cubic_devices"][device_identity]["configuration"][
-                "valveState"
-            ] = (
-                CUBIC_SECURE_VALVE_STATE_CLOSED
-                if expect_closed
-                else CUBIC_SECURE_VALVE_STATE_OPEN
+            configuration = self.data["cubic_devices"][device_identity].get(
+                "configuration"
             )
+            if configuration is not None:
+                configuration["valveState"] = (
+                    CUBIC_SECURE_VALVE_STATE_CLOSED
+                    if expect_closed
+                    else CUBIC_SECURE_VALVE_STATE_OPEN
+                )
             self._resolve_valve_action(device_identity)
             _LOGGER.debug(
                 "Giving up on confirming valve %s reached the requested "
@@ -848,9 +852,39 @@ class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
             # and the leak-detection expiry check
             # (_schedule_leak_detection_expiry_refresh) only ever calls
             # this at or after a pause's own target end time.
-            self.async_set_updated_data(self.data)
+            self._publish_updated_data()
 
         return success
+
+    async def refresh_cubic_secure_pressure_test_schedule_with_client(
+        self, lk_inst: LKSystemsManager, device_identity: str
+    ) -> bool:
+        """Fetch one Cubic Secure device's pressure-test schedule via an
+        already-authenticated `lk_inst`, and publish it - the
+        confirmation read set_pressure_test_schedule_for_serial's own
+        write wants, mirroring refresh_cubic_secure_configuration_with_client().
+        """
+        success = await lk_inst.get_cubic_secure_pressure_test_schedule(
+            device_identity
+        )
+        if success and self.data:
+            self.data["cubic_devices"][device_identity]["pressure_test_schedule"] = (
+                lk_inst.cubic_secure_pressure_test_schedule
+            )
+            self._publish_updated_data()
+        return success
+
+    def _publish_updated_data(self) -> None:
+        """Notify listeners of a manual data update, refreshing
+        next_update_time/update_time to match the schedule reset
+        async_set_updated_data() performs (see its own docstring) - or a
+        countdown built on next_update_time (sensor.py's Next Update In)
+        would freeze until the rescheduled poll actually happens.
+        """
+        now = dt_util.now()
+        self.data["update_time"] = now.isoformat()
+        self.data["next_update_time"] = (now + self.update_interval).isoformat()
+        self.async_set_updated_data(self.data)
 
     async def _update_cubic_secure_configuration(
         self, device_identity: str, *, force_update: bool
@@ -970,7 +1004,10 @@ class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
         explicitly requested for it via async_request_forced_refresh()."""
         if device_identity in forced_device_ids:
             return True
-        return int(time.time()) - cache_updated > self.update_interval.total_seconds()
+        return (
+            int(dt_util.utcnow().timestamp()) - cache_updated
+            > self.update_interval.total_seconds()
+        )
 
     async def _fetch_data(self) -> LkStructureResp:  # noqa: C901
         """Fetch the latest data from the source."""
@@ -1260,6 +1297,24 @@ class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
                                 lk_inst.cubic_secure_configuration,
                                 dt_util.utcnow(),
                             )
+                            # A separate endpoint from configuration/
+                            # thresholds, fetched best-effort: a failure
+                            # here shouldn't take down this device's
+                            # whole update, since nothing else depends on
+                            # it - cubic_secure_pressure_test_schedule()
+                            # is already defensive about it being None.
+                            try:
+                                if await lk_inst.get_cubic_secure_pressure_test_schedule(
+                                    device_identity
+                                ):
+                                    resp["cubic_devices"][device_identity][
+                                        "pressure_test_schedule"
+                                    ] = lk_inst.cubic_secure_pressure_test_schedule
+                            except Exception:
+                                _LOGGER.debug(
+                                    "Failed to fetch pressure test schedule for %s",
+                                    device_identity,
+                                )
                         except Exception as err:
                             # Sensors index these keys directly, so they
                             # must exist even on failure; reuse this
@@ -1277,6 +1332,10 @@ class LKSystemCoordinator(DataUpdateCoordinator[LkStructureResp]):
                             device_entry.setdefault(
                                 "configuration",
                                 previous_device_data.get("configuration"),
+                            )
+                            device_entry.setdefault(
+                                "pressure_test_schedule",
+                                previous_device_data.get("pressure_test_schedule"),
                             )
                             _LOGGER.warning(
                                 "Error fetching cubic measurements: %s", str(err)
@@ -1417,6 +1476,23 @@ def cubic_secure_configuration(
     """
     cubic_device = coordinator.data["cubic_devices"][device_identity]
     return cubic_device.get("configuration") or {}
+
+
+def cubic_secure_pressure_test_schedule(
+    coordinator: LKSystemCoordinator, device_identity: str
+) -> dict[str, Any] | None:
+    """Return a Cubic Secure device's last-fetched pressure-test schedule
+    ({"hour": int, "minute": int}), or None if it hasn't been fetched
+    successfully yet.
+
+    Fetched at a separate endpoint from configuration/thresholds (see
+    _fetch_data's own comment), so it can be missing on its own -
+    None here rather than {} distinguishes "never fetched" from a
+    schedule that's somehow empty, since every real response has both
+    fields.
+    """
+    cubic_device = coordinator.data["cubic_devices"][device_identity]
+    return cubic_device.get("pressure_test_schedule")
 
 
 def cubic_secure_device_info(

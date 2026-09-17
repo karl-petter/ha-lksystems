@@ -22,6 +22,7 @@ from custom_components.lksystems.services import (
     close_valve_for_serial,
     open_valve_for_serial,
     pause_leak_detection_for_serial,
+    set_pressure_test_schedule_for_serial,
     set_thresholds_for_serial,
 )
 
@@ -308,6 +309,61 @@ class TestSetThresholdsForSerial:
             "get_cubic_secure_configuration",
             CUBIC_IDENTITY,
             False,
+        ) in fake_manager.calls
+
+
+class TestSetPressureTestScheduleForSerial:
+    """Direct tests for set_pressure_test_schedule_for_serial (see
+    TestValveActionForSerial's own docstring for why - same reasoning)."""
+
+    async def test_calls_the_client_with_the_given_time(self, hass, fake_manager):
+        entry, _ = await _setup_entry_and_get_cubic_device(hass, fake_manager)
+
+        with patch_all_managers(fake_manager):
+            result = await set_pressure_test_schedule_for_serial(
+                hass, entry, CUBIC_IDENTITY, 3, 11
+            )
+
+        assert result is True
+        assert (
+            "cubic_secure_set_pressure_test_schedule",
+            CUBIC_IDENTITY,
+            3,
+            11,
+        ) in fake_manager.calls
+
+    async def test_login_failure_returns_false_and_does_not_call_the_client(
+        self, hass, fake_manager
+    ):
+        entry, _ = await _setup_entry_and_get_cubic_device(hass, fake_manager)
+        fake_manager.login_result = False
+
+        with patch_all_managers(fake_manager):
+            result = await set_pressure_test_schedule_for_serial(
+                hass, entry, CUBIC_IDENTITY, 3, 11
+            )
+
+        assert result is False
+        assert not any(
+            c[0] == "cubic_secure_set_pressure_test_schedule"
+            for c in fake_manager.calls
+        )
+
+    async def test_reuses_one_session_for_the_write_and_its_confirmation_read(
+        self, hass, fake_manager
+    ):
+        entry, _ = await _setup_entry_and_get_cubic_device(hass, fake_manager)
+        fake_manager.calls.clear()
+
+        with patch_all_managers(fake_manager):
+            await set_pressure_test_schedule_for_serial(
+                hass, entry, CUBIC_IDENTITY, 3, 11
+            )
+
+        assert fake_manager.calls.count(("login",)) == 1
+        assert (
+            "get_cubic_secure_pressure_test_schedule",
+            CUBIC_IDENTITY,
         ) in fake_manager.calls
 
 

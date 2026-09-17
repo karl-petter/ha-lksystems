@@ -90,6 +90,7 @@ class FakeLKSystemsManager:
         self.hub_devices: dict = {}
         self.cubic_secure_measurement: dict | None = None
         self.cubic_secure_configuration: dict | None = None
+        self.cubic_secure_pressure_test_schedule: dict | None = None
 
         # Per-call canned data, keyed by device/hub identity. Tests set
         # these before triggering a coordinator update.
@@ -98,6 +99,8 @@ class FakeLKSystemsManager:
         self.hub_devices_by_hub: dict[str, dict] = {}
         self.cubic_measurement_data: dict | None = None
         self.cubic_configuration_data: dict | None = None
+        self.cubic_pressure_test_schedule_data: dict | None = {"hour": 4, "minute": 0}
+        self.cubic_pressure_test_schedules_by_device: dict[str, dict] = {}
         # Per-cubic-device overrides, keyed by device identity - takes
         # precedence over the single cubic_measurement_data/
         # cubic_configuration_data above when set for that identity, so
@@ -119,7 +122,9 @@ class FakeLKSystemsManager:
         self.get_hub_devices_result = True
         self.get_cubic_secure_measurement_result = True
         self.get_cubic_secure_configuration_result = True
+        self.get_cubic_secure_pressure_test_schedule_result = True
         self.cubic_secure_set_thresholds_result = True
+        self.cubic_secure_set_pressure_test_schedule_result = True
         # Simulates a real fetch taking a while - e.g. pylksystems
         # honoring a long Retry-After from LK's own rate limiter, which
         # can take tens of seconds on a real device (confirmed live).
@@ -214,6 +219,18 @@ class FakeLKSystemsManager:
                 )
         return self.get_cubic_secure_configuration_result
 
+    async def get_cubic_secure_pressure_test_schedule(self, device_identity):
+        self.calls.append(
+            ("get_cubic_secure_pressure_test_schedule", device_identity)
+        )
+        if self.get_cubic_secure_pressure_test_schedule_result:
+            self.cubic_secure_pressure_test_schedule = (
+                self.cubic_pressure_test_schedules_by_device.get(
+                    device_identity, self.cubic_pressure_test_schedule_data
+                )
+            )
+        return self.get_cubic_secure_pressure_test_schedule_result
+
     async def set_thermostat_temperature(self, device_id, temperature):
         self.calls.append(("set_thermostat_temperature", device_id, temperature))
         return self.set_thermostat_temperature_result
@@ -239,9 +256,22 @@ class FakeLKSystemsManager:
         self.calls.append(
             ("cubic_secure_set_pressure_test_schedule", cubic_identity, hour, minute)
         )
+        if self.cubic_secure_set_pressure_test_schedule_result:
+            self.cubic_pressure_test_schedules_by_device[cubic_identity] = {
+                "hour": hour,
+                "minute": minute,
+            }
+        return self.cubic_secure_set_pressure_test_schedule_result
 
     async def cubic_secure_set_thresholds(self, cubic_identity, thresholds):
         self.calls.append(("cubic_secure_set_thresholds", cubic_identity, thresholds))
+        if self.cubic_secure_set_thresholds_result:
+            current = self.cubic_configurations_by_device.get(
+                cubic_identity, self.cubic_configuration_data
+            )
+            updated = {**current, "thresholds": thresholds}
+            self.cubic_configurations_by_device[cubic_identity] = updated
+            self.cubic_configurations_cached_by_device[cubic_identity] = updated
         return self.cubic_secure_set_thresholds_result
 
 
