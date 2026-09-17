@@ -42,8 +42,8 @@ class LKPressureTestScheduleTime(
     The API has no seconds field, so this always reads/writes :00.
     """
 
-    _attr_name = "Pressure Test Schedule"
-    _attr_icon = "mdi:clock-outline"
+    _attr_name = "Automatic Pressure Test Time"
+    _attr_icon = "mdi:gauge"
     _attr_entity_category = EntityCategory.CONFIG
 
     def __init__(self, coordinator: LKSystemCoordinator, device_identity: str) -> None:

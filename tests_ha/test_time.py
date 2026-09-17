@@ -1,4 +1,4 @@
-"""Tests for time.py: the "Pressure Test Schedule" time entity.
+"""Tests for time.py: the "Automatic Pressure Test Time" time entity.
 
 Reads/writes the device's pressure-test schedule (hour:minute), fetched
 at its own endpoint separate from configuration/thresholds - see
